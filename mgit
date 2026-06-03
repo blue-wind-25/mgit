@@ -5,8 +5,9 @@ mgit - Multi-repo Git automation tool
 Recursively manages git repositories with submodules,
 handling commit ordering, signing enforcement, and ref updates.
 
-Requires: Python 3.6+, git (stock), bash (stock)
-Tested on: CentOS 7, Ubuntu 18+
+Requires: Python 3.6+, git (stock)
+Zero pip dependencies — stdlib only.
+Tested on: CentOS 7, Ubuntu 18+, Windows 10/11 (Git for Windows + Python 3)
 """
 
 from __future__ import print_function
@@ -17,16 +18,21 @@ import sys
 import shutil
 import tempfile
 import fnmatch
-import argparse
 import configparser
 import subprocess
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+IS_WINDOWS = sys.platform == "win32"
 
 # ---------------------------------------------------------------------------
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.1.0"
+VERSION = "1.2.1"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -61,9 +67,9 @@ DEFAULT_NO_SIGN_EMAILS: List[str] = [
 class MgitConfig:
     """
     Loads .mgitconfig from (in order):
-      1. cwd
+      1. repo root (cwd at startup)
       2. ~/.mgitconfig
-      3. Built-in defaults
+    Settings extend built-in defaults; they do not replace them.
     """
 
     def __init__(self) -> None:
@@ -89,8 +95,7 @@ class MgitConfig:
         if parser.has_option("signing", "no_sign_emails"):
             raw = parser.get("signing", "no_sign_emails")
             extras = [e.strip() for e in raw.splitlines() if e.strip()]
-            # Append to defaults, not replace
-            self.no_sign_emails.extend(extras)
+            self.no_sign_emails.extend(extras)  # append, never replace
 
         if parser.has_option("behavior", "verbose"):
             self.verbose = parser.getboolean("behavior", "verbose")
@@ -121,10 +126,7 @@ def die(msg: str, code: int = 1) -> None:
 
 def prompt(msg: str, default: str = "") -> str:
     """Prompt the user for input, with an optional default value."""
-    if default:
-        display = "{} [{}]: ".format(msg, default)
-    else:
-        display = "{}: ".format(msg)
+    display = "{} [{}]: ".format(msg, default) if default else "{}: ".format(msg)
     try:
         answer = input(display).strip()
     except (KeyboardInterrupt, EOFError):
@@ -169,7 +171,7 @@ def run_git(args: List[str], cwd: str = None, check: bool = True,
 
 
 def git_output(args: List[str], cwd: str = None) -> str:
-    """Run git and return stdout, never raising on error (returns '')."""
+    """Run git and return stdout; returns '' on error, never raises."""
     result = run_git(args, cwd=cwd, check=False, capture=True)
     return result.stdout.strip()
 
@@ -206,7 +208,7 @@ def get_toplevel(path: str) -> Optional[str]:
 def get_submodule_paths(repo_root: str) -> List[str]:
     """
     Return list of absolute paths for all direct submodules of repo_root,
-    as declared in .gitmodules. Returns [] if none.
+    as declared in .gitmodules. Returns [] if none or unpopulated.
     """
     gitmodules = os.path.join(repo_root, ".gitmodules")
     if not os.path.isfile(gitmodules):
@@ -246,9 +248,7 @@ def build_repo_tree(root: str) -> List[str]:
 
 
 def build_repo_tree_topdown(root: str) -> List[str]:
-    """
-    Top-down order (root first). Used for pull/fetch/status.
-    """
+    """Top-down order (root first). Used for status/fetch/diff/log."""
     result = [root]
     for sub in get_submodule_paths(root):
         result.extend(build_repo_tree_topdown(sub))
@@ -257,17 +257,88 @@ def build_repo_tree_topdown(root: str) -> List[str]:
 
 def find_invocation_root(start: str) -> str:
     """
-    Walk up from start to find the highest git repo that contains start
-    as a submodule (directly or transitively). If start itself is not
-    a submodule of any parent, return start's own toplevel.
-
-    This ensures 'mgit' invoked from a subdir does NOT walk up into a
-    parent repo it doesn't own.
+    Return the toplevel of the git repo containing start.
+    mgit intentionally does not walk up into parent repos — running mgit
+    from inside a submodule operates on that submodule tree only.
     """
     toplevel = get_toplevel(start)
     if toplevel is None:
         die("Not inside a git repository: {}".format(start))
     return toplevel
+
+# ---------------------------------------------------------------------------
+# Editor helper
+# ---------------------------------------------------------------------------
+
+def resolve_editor(cwd: str = None) -> str:
+    """
+    Return the editor to use for commit messages.
+    Resolution order (mirrors git's own logic):
+      GIT_EDITOR env var
+      → core.editor git config
+      → VISUAL env var
+      → EDITOR env var
+      → notepad (Windows) / nano (Unix) as last resort
+    """
+    editor = (
+        os.environ.get("GIT_EDITOR")
+        or git_output(["config", "--get", "core.editor"], cwd=cwd)
+        or os.environ.get("VISUAL")
+        or os.environ.get("EDITOR")
+        or ("notepad" if IS_WINDOWS else "nano")
+    )
+    return editor
+
+
+def open_editor_for_message(repo_label: str, cwd: str = None) -> str:
+    """
+    Open the configured editor with a temp file pre-seeded with a context
+    comment, wait for the user to save and exit, then return the message
+    with comment lines stripped.
+
+    Returns '' if the user saves an empty or comment-only file (aborts
+    the commit for that repo, consistent with git behaviour).
+    """
+    editor = resolve_editor(cwd=cwd)
+
+    # Build the template — context header so the user knows which repo
+    template = (
+        "\n"
+        "# Please enter the commit message for: {}\n"
+        "# Lines starting with '#' will be ignored.\n"
+        "# An empty message aborts the commit for this repo.\n"
+    ).format(repo_label)
+
+    # Use a .txt extension so Notepad on Windows opens without complaints
+    suffix = ".txt" if IS_WINDOWS else ".git-commit-msg"
+    fd, tmp_path = tempfile.mkstemp(prefix="mgit-msg-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "w", newline="\n") as f:
+            f.write(template)
+
+        # On Windows, shlex.split isn't reliable for paths with spaces;
+        # pass the editor+path as a single shell string so cmd.exe handles it.
+        if IS_WINDOWS:
+            ret = subprocess.call("{} {}".format(editor, tmp_path), shell=True)
+        else:
+            import shlex
+            ret = subprocess.call(shlex.split(editor) + [tmp_path])
+
+        if ret != 0:
+            die("Editor exited with code {}. Aborting.".format(ret))
+
+        with open(tmp_path, "r", newline=None) as f:
+            raw = f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # Strip comment lines and normalise line endings
+    lines = [l.rstrip("\r") for l in raw.splitlines()
+             if not l.lstrip().startswith("#")]
+    return "\n".join(lines).strip()
 
 # ---------------------------------------------------------------------------
 # Signing helpers
@@ -288,7 +359,6 @@ def should_skip_signing(cwd: str = None) -> Tuple[bool, str]:
                 return True, "email '{}' matches no-sign pattern '{}'".format(
                     email, pattern)
         except re.error:
-            # Fall back to fnmatch for simple glob patterns
             if fnmatch.fnmatch(email, pattern.lower()):
                 return True, "email '{}' matches no-sign glob '{}'".format(
                     email, pattern)
@@ -296,49 +366,46 @@ def should_skip_signing(cwd: str = None) -> Tuple[bool, str]:
     return False, ""
 
 
-def verify_gpg_available(cwd: str = None) -> None:
+def check_gpg_available(cwd: str = None) -> None:
     """
-    Verify that GPG signing will actually work before attempting a commit.
-    Dies with a clear message if it won't.
+    Verify that GPG signing can actually work before touching any repo.
+    GPG signing is driven entirely by git config (commit.gpgsign / user.signingkey);
+    mgit never injects -S itself. This function is a pre-flight sanity check only.
+    Dies with a clear message if the config looks broken.
     """
-    # Check signing key is configured
-    key = git_output(["config", "--get", "user.signingkey"], cwd=cwd)
-    gpg_sign = git_output(["config", "--get", "commit.gpgsign"], cwd=cwd)
+    key      = git_output(["config", "--get", "user.signingkey"], cwd=cwd)
+    gpg_sign = git_output(["config", "--get", "commit.gpgsign"],  cwd=cwd)
 
-    # If neither is configured, signing will fail — refuse early
+    # gpg_sign is '' when unset; treat that as "not enabled"
     if not key and gpg_sign.lower() not in ("true", "1", "yes"):
         die(
-            "GPG signing is required but no signing key is configured.\n"
+            "GPG signing is enabled in git config but no signing key is set.\n"
             "       Set one with: git config --global user.signingkey <KEYID>\n"
-            "       Or configure commit.gpgsign=true with a default key.\n"
+            "       Or disable auto-signing: git config --global commit.gpgsign false\n"
             "       To skip signing for AI agents, ensure user.email matches\n"
             "       a known bot pattern (see ~/.mgitconfig)."
         )
 
-    # Also check gpg binary exists
     gpg_prog = git_output(["config", "--get", "gpg.program"], cwd=cwd) or "gpg"
-    found = subprocess.run(
-        ["which", gpg_prog],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    if found.returncode != 0:
-        die("GPG signing required but '{}' binary not found in PATH.".format(
-            gpg_prog))
+    if not shutil.which(gpg_prog):
+        die("GPG signing is configured but '{}' was not found in PATH.\n"
+            "       Install GPG or set gpg.program to the correct binary.".format(gpg_prog))
 
 # ---------------------------------------------------------------------------
-# has_staged_changes / has_unstaged_changes
+# Working-tree state helpers
 # ---------------------------------------------------------------------------
 
 def has_staged_changes(cwd: str) -> bool:
+    """Return True if there are changes staged in the index."""
     result = subprocess.run(
         ["git", "diff", "--cached", "--quiet"],
         cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-    return result.returncode != 0  # non-zero = there are staged changes
+    return result.returncode != 0
 
 
 def has_any_changes(cwd: str) -> bool:
-    """True if working tree or index has any modifications."""
+    """Return True if working tree or index has any modifications."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -368,21 +435,14 @@ def submodule_refs_dirty(parent: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def find_gh() -> Optional[str]:
-    """Return the path to the gh binary, or None if not found."""
-    result = subprocess.run(
-        ["which", "gh"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        universal_newlines=True
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
-    return None
+    """Return the path to the gh binary using shutil.which (cross-platform)."""
+    return shutil.which("gh")
 
 
 def offer_gh_install() -> None:
     """
-    Print platform-appropriate install instructions for gh and exit.
-    Never installs automatically — user's choice.
+    Print platform-appropriate install/download instructions for gh and exit.
+    Never installs automatically.
     """
     import platform
     system = platform.system().lower()
@@ -393,25 +453,28 @@ def offer_gh_install() -> None:
     if system == "darwin":
         print("  Install with Homebrew:")
         print("      brew install gh")
+        print()
+        print("  Or download from: https://github.com/cli/cli/releases/latest")
     elif system == "linux":
         print("  Install on Debian/Ubuntu:")
-        print("      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\")
-        print("        | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg")
-        print("      echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \\")
-        print("        https://cli.github.com/packages stable main\" \\")
-        print("        | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null")
         print("      sudo apt update && sudo apt install gh")
         print()
         print("  Install on CentOS/RHEL/Fedora:")
-        print("      sudo dnf install 'dnf-command(config-manager)'")
-        print("      sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo")
         print("      sudo dnf install gh")
+        print()
+        print("  Or download from: https://github.com/cli/cli/releases/latest")
     elif system == "windows":
-        print("  Install with winget:")
+        print("  Option 1 — winget (built into Windows 10/11):")
         print("      winget install --id GitHub.cli")
         print()
-        print("  Or with Scoop:")
+        print("  Option 2 — Scoop:")
         print("      scoop install gh")
+        print()
+        print("  Option 3 — manual download:")
+        print("      https://github.com/cli/cli/releases/latest")
+        print("      Download the *_windows_amd64.msi installer and run it.")
+        print()
+        print("  After installing, open a new terminal so PATH is refreshed.")
     else:
         print("  Download from: https://github.com/cli/cli/releases/latest")
 
@@ -422,12 +485,10 @@ def offer_gh_install() -> None:
     sys.exit(1)
 
 
-def require_gh() -> str:
-    """Return gh path or offer install instructions and exit."""
-    gh = find_gh()
-    if not gh:
+def require_gh() -> None:
+    """Exit with install instructions if gh is not available."""
+    if not find_gh():
         offer_gh_install()
-    return gh
 
 
 def run_gh(args: List[str], check: bool = True,
@@ -467,22 +528,57 @@ def get_origin_url(cwd: str = None) -> str:
 def repo_name_from_url(url: str) -> str:
     """
     Extract the bare repo name from a remote URL.
-    Works for both https://github.com/owner/name.git and git@github.com:owner/name.git
+    Handles both https://github.com/owner/name.git and git@github.com:owner/name.git.
     Returns '' if parsing fails.
     """
     if not url:
         return ""
-    # Strip trailing .git
     url = re.sub(r"\.git$", "", url)
-    # Last path component
-    parts = re.split(r"[/:]", url)
-    parts = [p for p in parts if p]
+    parts = [p for p in re.split(r"[/:]", url) if p]
     return parts[-1] if parts else ""
 
 
 def gh_repo_owner() -> str:
     """Return the authenticated GitHub username via gh, or ''."""
     return gh_output(["api", "user", "--jq", ".login"])
+
+# ---------------------------------------------------------------------------
+# Shared commit helper
+# ---------------------------------------------------------------------------
+
+def do_commit(repo: str, rel: str, msg: str, is_bot: bool,
+              bot_reason: str) -> bool:
+    """
+    Run git commit in repo. Signing is driven by git config (commit.gpgsign);
+    mgit's only role is to suppress it for known bots via --no-gpg-sign.
+
+    Returns True if the commit was made, False if the user chose to skip
+    (only possible when gpgsign is unset and the user declines to continue).
+    """
+    if is_bot:
+        info("Signing suppressed for {}: {}".format(rel, bot_reason))
+        run_git(["commit", "--no-gpg-sign", "-m", msg], cwd=repo)
+        return True
+
+    gpg_sign = git_output(["config", "--get", "commit.gpgsign"], cwd=repo)
+
+    if gpg_sign.lower() in ("true", "1", "yes"):
+        # Signing is explicitly enabled — verify GPG is usable, then commit
+        check_gpg_available(cwd=repo)
+        run_git(["commit", "-m", msg], cwd=repo)
+        return True
+
+    # commit.gpgsign is not set — commits will be unsigned.
+    # Warn the human and ask whether to proceed. Default is yes so that
+    # automated / non-interactive use (e.g. pipes) continues safely.
+    warn("commit.gpgsign is not set for '{}' — this commit will be unsigned.".format(rel))
+    print("[mgit]        To enable signing: git config --global commit.gpgsign true", file=sys.stderr)
+    if not prompt_yes_no("Continue without signing?", default=True):
+        info("Skipping commit for {}.".format(rel))
+        return False
+
+    run_git(["commit", "-m", msg], cwd=repo)
+    return True
 
 # ---------------------------------------------------------------------------
 # detach — split a subdir into its own new GitHub repo and re-add as submodule
@@ -495,21 +591,15 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
 
     Usage: mgit detach <subdir>
     """
-    # -----------------------------------------------------------------------
-    # 0. Parse args
-    # -----------------------------------------------------------------------
     if not extra_args:
         die("Usage: mgit detach <subdir>\n"
             "       Detaches a subdirectory into its own repo and adds it as a submodule.")
 
-    subdir_arg = extra_args[0].rstrip("/")
-
-    # Resolve subdir relative to repo root
-    subdir_abs = os.path.normpath(os.path.join(root, subdir_arg))
-    subdir_rel = os.path.relpath(subdir_abs, root)  # canonical relative path
+    subdir_abs = os.path.normpath(os.path.join(root, extra_args[0].rstrip("/\\")))
+    subdir_rel = os.path.relpath(subdir_abs, root)
 
     # -----------------------------------------------------------------------
-    # 1. Validate
+    # Validate
     # -----------------------------------------------------------------------
     if not os.path.isdir(subdir_abs):
         die("Subdir not found: {}".format(subdir_abs))
@@ -517,22 +607,16 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     if not subdir_abs.startswith(root + os.sep):
         die("Subdir must be inside the repo root: {}".format(root))
 
-    # Must not already be a submodule
-    existing_subs = get_submodule_paths(root)
-    if subdir_abs in existing_subs:
+    if subdir_abs in get_submodule_paths(root):
         die("'{}' is already a submodule.".format(subdir_rel))
 
-    # Must not have uncommitted changes in the repo
     if has_any_changes(root):
         die("The repo has uncommitted changes. Please commit or stash them first.")
 
-    # -----------------------------------------------------------------------
-    # 2. Require gh
-    # -----------------------------------------------------------------------
     require_gh()
 
     # -----------------------------------------------------------------------
-    # 3. Gather info from user
+    # Gather info from user
     # -----------------------------------------------------------------------
     origin_url  = get_origin_url(root)
     parent_name = repo_name_from_url(origin_url) or os.path.basename(root)
@@ -542,16 +626,14 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
         subdir_rel, parent_name))
     print()
 
-    default_repo_name = os.path.basename(subdir_rel)
-    repo_name    = prompt("New repo name", default=default_repo_name)
-    repo_desc    = prompt("Description (optional)", default="")
-    is_public    = prompt_yes_no("Make the new repo public?", default=True)
+    repo_name = prompt("New repo name", default=os.path.basename(subdir_rel))
+    repo_desc = prompt("Description (optional)", default="")
+    is_public = prompt_yes_no("Make the new repo public?", default=True)
 
-    # Warn about commit message leaking private repo name
     include_origin = False
     if is_public and origin_url:
         print()
-        warn("The parent repo name '{}' will appear in the initial commit message.".format(
+        warn("The parent repo name '{}' may appear in the initial commit message.".format(
             parent_name))
         include_origin = prompt_yes_no(
             "Include parent repo name in initial commit message?", default=False)
@@ -564,27 +646,25 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
 
     print()
     info("Summary:")
-    info("  Subdir       : {}".format(subdir_rel))
-    info("  New repo     : {}".format(repo_name))
-    info("  Visibility   : {}".format("public" if is_public else "private"))
-    info("  Initial msg  : {}".format(initial_commit_msg))
+    info("  Subdir      : {}".format(subdir_rel))
+    info("  New repo    : {}".format(repo_name))
+    info("  Visibility  : {}".format("public" if is_public else "private"))
+    info("  Initial msg : {}".format(initial_commit_msg))
     print()
 
     if not prompt_yes_no("Proceed?", default=True):
         die("Aborted.", code=0)
 
     # -----------------------------------------------------------------------
-    # 4. Create new git repo in a temp dir and populate it
+    # Build new repo in a temp dir
     # -----------------------------------------------------------------------
     tmpdir = tempfile.mkdtemp(prefix="mgit-detach-")
+    new_repo_url = ""
     info("Working in temp dir: {}".format(tmpdir))
 
     try:
-        # Init
         run_git(["init"], cwd=tmpdir)
 
-        # Copy contents of subdir into temp repo root
-        # Use rsync-style copy: contents of subdir_abs go into tmpdir
         for item in os.listdir(subdir_abs):
             src = os.path.join(subdir_abs, item)
             dst = os.path.join(tmpdir, item)
@@ -593,10 +673,9 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
             else:
                 shutil.copy2(src, dst)
 
-        # Stage everything
         run_git(["add", "-A"], cwd=tmpdir)
 
-        # Carry over git identity from parent repo
+        # Carry over git identity from parent
         user_name  = git_output(["config", "user.name"],  cwd=root)
         user_email = git_output(["config", "user.email"], cwd=root)
         if user_name:
@@ -604,44 +683,33 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
         if user_email:
             run_git(["config", "user.email", user_email], cwd=tmpdir)
 
-        # Commit — apply same signing logic as parent
         skip_sign, reason = should_skip_signing(cwd=root)
-        if skip_sign:
-            info("Signing skipped for new repo: {}".format(reason))
-            run_git(["commit", "-m", initial_commit_msg], cwd=tmpdir)
-        else:
-            verify_gpg_available(cwd=root)
-            run_git(["commit", "-S", "-m", initial_commit_msg], cwd=tmpdir)
+        do_commit(tmpdir, "(new repo)", initial_commit_msg, skip_sign, reason)
 
-        # -----------------------------------------------------------------------
-        # 5. Create GitHub repo and push
-        # -----------------------------------------------------------------------
+        # Create GitHub repo and push
         info("Creating GitHub repo '{}'...".format(repo_name))
         visibility_flag = "--public" if is_public else "--private"
-        gh_args = ["repo", "create", repo_name, visibility_flag, "--source", tmpdir,
-                   "--remote", "origin", "--push"]
+        gh_args = ["repo", "create", repo_name, visibility_flag,
+                   "--source", tmpdir, "--remote", "origin", "--push"]
         if repo_desc:
             gh_args += ["--description", repo_desc]
         run_gh(gh_args)
 
-        # Retrieve the new repo's URL
-        new_repo_url = gh_output(["repo", "view", repo_name, "--json", "sshUrl", "--jq", ".sshUrl"])
+        new_repo_url = gh_output(
+            ["repo", "view", repo_name, "--json", "sshUrl", "--jq", ".sshUrl"])
         if not new_repo_url:
-            # Fallback: construct from owner + name
             owner = gh_repo_owner()
             new_repo_url = "git@github.com:{}/{}.git".format(owner, repo_name)
         info("New repo URL: {}".format(new_repo_url))
 
     except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
         die("Failed during new repo setup: {}".format(e))
 
     finally:
-        # Always clean up temp dir
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     # -----------------------------------------------------------------------
-    # 6. Remove subdir from parent and add as submodule
+    # Wire up as submodule in parent
     # -----------------------------------------------------------------------
     info("Removing '{}' from parent repo...".format(subdir_rel))
     run_git(["rm", "-r", subdir_rel], cwd=root)
@@ -650,19 +718,10 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     run_git(["submodule", "add", new_repo_url, subdir_rel], cwd=root)
     run_git(["submodule", "update", "--init", subdir_rel], cwd=root)
 
-    # -----------------------------------------------------------------------
-    # 7. Commit the change in parent
-    # -----------------------------------------------------------------------
     commit_msg = "chore: detach {} as submodule ({})".format(subdir_rel, repo_name)
     info("Committing detach in parent repo...")
-
     skip_sign, reason = should_skip_signing(cwd=root)
-    if skip_sign:
-        info("Signing skipped: {}".format(reason))
-        run_git(["commit", "-m", commit_msg], cwd=root)
-    else:
-        verify_gpg_available(cwd=root)
-        run_git(["commit", "-S", "-m", commit_msg], cwd=root)
+    do_commit(root, ".", commit_msg, skip_sign, reason)
 
     print()
     info("Done. '{}' is now a submodule pointing to {}.".format(
@@ -671,7 +730,7 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# attach — copy a subdir into an existing submodule repo
+# attach — move a subdir's contents into an existing submodule
 # ---------------------------------------------------------------------------
 
 def cmd_attach(root: str, extra_args: List[str]) -> None:
@@ -680,29 +739,19 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
     then remove the subdir from the parent.
 
     Usage: mgit attach <subdir> <submodule-path>
-
-    The subdir's contents are copied into <submodule-path>, committed
-    there, and the original <subdir> is removed from the parent. The
-    parent then gets a commit recording both changes.
     """
-    # -----------------------------------------------------------------------
-    # 0. Parse args
-    # -----------------------------------------------------------------------
     if len(extra_args) < 2:
         die("Usage: mgit attach <subdir> <submodule-path>\n"
             "       Moves a subdirectory's contents into an existing submodule.")
 
-    subdir_arg = extra_args[0].rstrip("/")
-    target_arg = extra_args[1].rstrip("/")
-
-    subdir_abs = os.path.normpath(os.path.join(root, subdir_arg))
+    subdir_abs = os.path.normpath(os.path.join(root, extra_args[0].rstrip("/\\")))
     subdir_rel = os.path.relpath(subdir_abs, root)
 
-    target_abs = os.path.normpath(os.path.join(root, target_arg))
+    target_abs = os.path.normpath(os.path.join(root, extra_args[1].rstrip("/\\")))
     target_rel = os.path.relpath(target_abs, root)
 
     # -----------------------------------------------------------------------
-    # 1. Validate
+    # Validate
     # -----------------------------------------------------------------------
     if not os.path.isdir(subdir_abs):
         die("Subdir not found: {}".format(subdir_abs))
@@ -710,20 +759,18 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
     if not subdir_abs.startswith(root + os.sep):
         die("Subdir must be inside the repo root.")
 
-    # Target must be an existing submodule
     existing_subs = get_submodule_paths(root)
+
     if target_abs not in existing_subs:
         die("'{}' is not a submodule of this repo.\n"
             "       Available submodules: {}".format(
                 target_rel,
                 ", ".join(os.path.relpath(s, root) for s in existing_subs) or "(none)"))
 
-    # Subdir must not itself be a submodule
     if subdir_abs in existing_subs:
         die("'{}' is already a submodule — use 'mgit push' to manage it.".format(
             subdir_rel))
 
-    # Must not have uncommitted changes
     if has_any_changes(root):
         die("The repo has uncommitted changes. Please commit or stash them first.")
     if has_any_changes(target_abs):
@@ -731,17 +778,15 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
             "Please commit or stash them first.".format(target_rel))
 
     # -----------------------------------------------------------------------
-    # 2. Determine destination inside target submodule
+    # Determine destination inside the target submodule
     # -----------------------------------------------------------------------
-    # By default, contents go into a subdirectory named after subdir inside target.
-    # Ask the user if they want a different destination path within the submodule.
-    default_dest_rel = os.path.basename(subdir_rel)
     print()
     info("Attaching '{}' into submodule '{}'.".format(subdir_rel, target_rel))
     print()
+
     dest_in_target = prompt(
         "Destination path inside '{}' (relative)".format(target_rel),
-        default=default_dest_rel
+        default=os.path.basename(subdir_rel)
     )
     dest_abs = os.path.normpath(os.path.join(target_abs, dest_in_target))
 
@@ -768,13 +813,12 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
         die("Aborted.", code=0)
 
     # -----------------------------------------------------------------------
-    # 3. Copy subdir contents into target submodule
+    # Copy subdir contents into target submodule
     # -----------------------------------------------------------------------
     info("Copying '{}' into '{}/{}'...".format(
         subdir_rel, target_rel, dest_in_target))
 
     if os.path.isdir(dest_abs):
-        # Merge: copy individual items
         for item in os.listdir(subdir_abs):
             src = os.path.join(subdir_abs, item)
             dst = os.path.join(dest_abs, item)
@@ -788,7 +832,7 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
         shutil.copytree(subdir_abs, dest_abs)
 
     # -----------------------------------------------------------------------
-    # 4. Commit inside target submodule
+    # Commit inside the target submodule
     # -----------------------------------------------------------------------
     info("Staging changes in submodule '{}'...".format(target_rel))
     run_git(["add", "-A"], cwd=target_abs)
@@ -798,20 +842,14 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
             "destination may already be identical.".format(target_rel))
 
     skip_sign, reason = should_skip_signing(cwd=target_abs)
-    if skip_sign:
-        info("Signing skipped for submodule: {}".format(reason))
-        run_git(["commit", "-m", commit_msg_sub], cwd=target_abs)
-    else:
-        verify_gpg_available(cwd=target_abs)
-        run_git(["commit", "-S", "-m", commit_msg_sub], cwd=target_abs)
+    do_commit(target_abs, target_rel, commit_msg_sub, skip_sign, reason)
 
     # -----------------------------------------------------------------------
-    # 5. Remove subdir from parent and commit
+    # Remove subdir from parent and commit
     # -----------------------------------------------------------------------
     info("Removing '{}' from parent repo...".format(subdir_rel))
     run_git(["rm", "-r", subdir_rel], cwd=root)
 
-    # Stage the updated submodule ref (which now points to the new commit)
     run_git(["add", target_rel], cwd=root)
 
     commit_msg_parent = "chore: attach {} into submodule {}".format(
@@ -819,12 +857,7 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
 
     info("Committing in parent repo...")
     skip_sign, reason = should_skip_signing(cwd=root)
-    if skip_sign:
-        info("Signing skipped: {}".format(reason))
-        run_git(["commit", "-m", commit_msg_parent], cwd=root)
-    else:
-        verify_gpg_available(cwd=root)
-        run_git(["commit", "-S", "-m", commit_msg_parent], cwd=root)
+    do_commit(root, ".", commit_msg_parent, skip_sign, reason)
 
     print()
     info("Done. '{}' has been moved into submodule '{}/{}'.".format(
@@ -833,164 +866,164 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Command implementations
+# Standard command implementations
 # ---------------------------------------------------------------------------
 
-# --- status -----------------------------------------------------------------
-
 def cmd_status(root: str, extra_args: List[str]) -> None:
-    repos = build_repo_tree_topdown(root)
-    for repo in repos:
+    for repo in build_repo_tree_topdown(root):
         rel = os.path.relpath(repo, root) if repo != root else "."
         info("=== status: {} ===".format(rel))
         run_git(["status"] + extra_args, cwd=repo, check=False)
         print()
 
 
-# --- add --------------------------------------------------------------------
-
 def cmd_add(root: str, extra_args: List[str]) -> None:
-    """
-    In each repo (topdown), run git add with the given args.
-    For the primary repo, git add already tracks changed submodule refs,
-    so no special handling needed here — refs update happens at push time.
-    """
-    repos = build_repo_tree_topdown(root)
-    for repo in repos:
+    """Stage in all repos top-down. Ref updates are deferred to mgit push."""
+    for repo in build_repo_tree_topdown(root):
         rel = os.path.relpath(repo, root) if repo != root else "."
         info("=== add: {} ===".format(rel))
         run_git(["add"] + extra_args, cwd=repo, check=False)
 
 
-# --- commit -----------------------------------------------------------------
+def _has_message_flag(args: List[str]) -> bool:
+    """Return True if args contains an explicit commit message flag."""
+    for a in args:
+        if a in ("-m", "--message"):
+            return True
+        if a.startswith("-m") and len(a) > 2:      # -m"msg"
+            return True
+        if a.startswith("--message="):              # --message=msg
+            return True
+    return False
+
+
+def _extract_message(args: List[str]) -> str:
+    """
+    Extract the commit message value from args containing -m / --message.
+    Handles:  -m "msg"  |  -m"msg"  |  --message "msg"  |  --message=msg
+    Returns '' if not found (caller should have checked _has_message_flag first).
+    """
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-m", "--message") and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("-m") and len(a) > 2:
+            return a[2:]
+        if a.startswith("--message="):
+            return a[len("--message="):]
+        i += 1
+    return ""
+
 
 def cmd_commit(root: str, extra_args: List[str]) -> None:
     """
     Commit all repos bottom-up (leaves first, root last).
-    - Signing enforced unless email matches no-sign list.
-    - Sub-repos committed first; root does NOT auto-update refs here
-      (refs update deferred to mgit push).
-    - Repos with nothing staged are skipped with a notice.
-    """
-    repos = build_repo_tree(root)  # bottom-up
 
-    for repo in repos:
+    If -m / --message is supplied, the same message is used for every repo
+    that has staged changes.
+
+    If no message flag is given, the configured editor is opened once per
+    repo that has staged changes. The editor prompt shows which repo is
+    being committed so the user can write an appropriate message. Saving
+    an empty message skips that repo (consistent with git behaviour).
+
+    Signing is driven entirely by git config (commit.gpgsign / user.signingkey).
+    mgit suppresses signing for known AI agents / bots via --no-gpg-sign.
+    """
+    has_msg = _has_message_flag(extra_args)
+
+    for repo in build_repo_tree(root):
         rel = os.path.relpath(repo, root) if repo != root else "."
 
         if not has_staged_changes(repo):
-            verbose("Nothing staged in {}, skipping commit.".format(rel))
+            verbose("Nothing staged in {}, skipping.".format(rel))
             continue
 
         info("=== commit: {} ===".format(rel))
 
-        skip_sign, reason = should_skip_signing(cwd=repo)
-        if skip_sign:
-            info("Signing skipped for {}: {}".format(rel, reason))
-            commit_args = ["commit"] + extra_args
+        if has_msg:
+            # -m supplied: extract the message value and route through do_commit
+            # so the unsigned-commit warning fires consistently.
+            # We reconstruct the message from the args rather than duplicating
+            # the signing logic here.
+            msg_value = _extract_message(extra_args)
+            skip_sign, reason = should_skip_signing(cwd=repo)
+            do_commit(repo, rel, msg_value, skip_sign, reason)
         else:
-            verify_gpg_available(cwd=repo)
-            commit_args = ["commit", "-S"] + extra_args
+            # No -m: open editor so the user can write a per-repo message
+            msg = open_editor_for_message(rel, cwd=repo)
+            if not msg:
+                info("Empty message — skipping commit for {}.".format(rel))
+                continue
+            skip_sign, reason = should_skip_signing(cwd=repo)
+            do_commit(repo, rel, msg, skip_sign, reason)
 
-        run_git(commit_args, cwd=repo)
-
-
-# --- push -------------------------------------------------------------------
 
 def cmd_push(root: str, extra_args: List[str]) -> None:
     """
-    Push sequence:
-      1. For each submodule (bottom-up): push to its own remote.
-      2. Back in root: if submodule refs have changed since last push,
-         stage them, make a signed ref-update commit, then push root.
-      3. If no ref changes, just push root normally.
+    Push sequence (bottom-up):
+      1. Push every submodule to its own remote.
+      2. If submodule refs changed, stage + commit them in root.
+      3. Push root.
     """
-    repos = build_repo_tree(root)  # bottom-up
-    submodules = repos[:-1]        # everything except root
-    parent = repos[-1]             # root
+    repos      = build_repo_tree(root)
+    submodules = repos[:-1]
+    parent     = repos[-1]
 
-    # Step 1: push all submodules
     for repo in submodules:
         rel = os.path.relpath(repo, root)
         info("=== push submodule: {} ===".format(rel))
         run_git(["push"] + extra_args, cwd=repo)
 
-    # Step 2: update submodule refs in root if needed
     if submodules and submodule_refs_dirty(parent):
         info("Staging updated submodule refs in root repo...")
         run_git(["add"] + [os.path.relpath(s, parent) for s in submodules],
                 cwd=parent)
-
         skip_sign, reason = should_skip_signing(cwd=parent)
-        if skip_sign:
-            info("Ref-update commit signing skipped: {}".format(reason))
-            run_git(["commit", "-m", CONFIG.ref_commit_msg], cwd=parent)
-        else:
-            verify_gpg_available(cwd=parent)
-            run_git(["commit", "-S", "-m", CONFIG.ref_commit_msg], cwd=parent)
+        do_commit(parent, ".", CONFIG.ref_commit_msg, skip_sign, reason)
 
-    # Step 3: push root
     info("=== push root: {} ===".format(os.path.basename(parent)))
     run_git(["push"] + extra_args, cwd=parent)
 
 
-# --- pull -------------------------------------------------------------------
-
 def cmd_pull(root: str, extra_args: List[str]) -> None:
-    """
-    Pull root first, then update submodules recursively.
-    After pull, sync submodule URLs and update to recorded SHAs.
-    """
+    """Pull root, then sync and update all submodules recursively."""
     info("=== pull root: {} ===".format(os.path.basename(root)))
     run_git(["pull"] + extra_args, cwd=root)
 
-    subs = get_submodule_paths(root)
-    if subs:
+    if get_submodule_paths(root):
         info("Updating submodules...")
         run_git(["submodule", "sync", "--recursive"], cwd=root)
         run_git(["submodule", "update", "--init", "--recursive"], cwd=root)
 
 
-# --- fetch ------------------------------------------------------------------
-
 def cmd_fetch(root: str, extra_args: List[str]) -> None:
-    repos = build_repo_tree_topdown(root)
-    for repo in repos:
+    for repo in build_repo_tree_topdown(root):
         rel = os.path.relpath(repo, root) if repo != root else "."
         info("=== fetch: {} ===".format(rel))
         run_git(["fetch"] + extra_args, cwd=repo, check=False)
 
 
-# --- diff -------------------------------------------------------------------
-
 def cmd_diff(root: str, extra_args: List[str]) -> None:
-    repos = build_repo_tree_topdown(root)
-    for repo in repos:
+    for repo in build_repo_tree_topdown(root):
         rel = os.path.relpath(repo, root) if repo != root else "."
         info("=== diff: {} ===".format(rel))
         run_git(["diff"] + extra_args, cwd=repo, check=False)
         print()
 
 
-# --- log --------------------------------------------------------------------
-
 def cmd_log(root: str, extra_args: List[str]) -> None:
-    repos = build_repo_tree_topdown(root)
-    for repo in repos:
+    for repo in build_repo_tree_topdown(root):
         rel = os.path.relpath(repo, root) if repo != root else "."
         info("=== log: {} ===".format(rel))
         run_git(["log"] + extra_args, cwd=repo, check=False)
         print()
 
 
-# --- passthrough ------------------------------------------------------------
-
 def cmd_passthrough(command: str, root: str, extra_args: List[str]) -> None:
-    """
-    For any git command not explicitly handled, run it in every repo
-    top-down, passing all args unchanged.
-    """
-    repos = build_repo_tree_topdown(root)
-    for repo in repos:
+    """Pass any unrecognised git command through to all repos top-down."""
+    for repo in build_repo_tree_topdown(root):
         rel = os.path.relpath(repo, root) if repo != root else "."
         info("=== {}: {} ===".format(command, rel))
         run_git([command] + extra_args, cwd=repo, check=False)
@@ -1000,10 +1033,6 @@ def cmd_passthrough(command: str, root: str, extra_args: List[str]) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-# Commands that need bottom-up ordering (leaves before root)
-BOTTOMUP_COMMANDS = {"commit", "push"}
-
-# Commands with dedicated implementations
 KNOWN_COMMANDS = {
     "status":  cmd_status,
     "add":     cmd_add,
@@ -1020,12 +1049,11 @@ KNOWN_COMMANDS = {
 
 def main() -> None:
     if len(sys.argv) < 2:
-        # No subcommand: show help
         print("mgit v{} - multi-repo git wrapper".format(VERSION))
         print("Usage: mgit <git-command> [args...]")
         print()
         print("Supported multi-repo commands:")
-        print("  status, add, commit, push, pull, fetch, diff, log")
+        print("  status, add, commit [-m \"msg\"], push, pull, fetch, diff, log")
         print()
         print("Submodule management:")
         print("  detach <subdir>                  — extract subdir into new GitHub repo, re-add as submodule")
@@ -1035,28 +1063,24 @@ def main() -> None:
         print("Run from any directory inside a git repo.")
         sys.exit(0)
 
-    # Handle --version
     if sys.argv[1] in ("--version", "-V"):
         print("mgit {}".format(VERSION))
         sys.exit(0)
 
-    # Handle --verbose flag before the git subcommand
     args = sys.argv[1:]
     if "--verbose" in args:
         CONFIG.verbose = True
         args = [a for a in args if a != "--verbose"]
 
-    command = args[0]
+    command    = args[0]
     extra_args = args[1:]
 
-    # Resolve the invocation root
-    cwd = os.path.abspath(os.getcwd())
+    cwd  = os.path.abspath(os.getcwd())
     root = find_invocation_root(cwd)
 
     verbose("Invocation root: {}".format(root))
     verbose("Command: {}  Extra args: {}".format(command, extra_args))
 
-    # Dispatch
     if command in KNOWN_COMMANDS:
         KNOWN_COMMANDS[command](root, extra_args)
     else:

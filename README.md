@@ -6,17 +6,19 @@ A recursive multi-repo git wrapper that treats a git repository with submodules 
 
 Standard git does not understand that submodules need to be committed and pushed before the parent updates its ref pointers. It also does not enforce signing consistently across all repos in a tree, and it does not know to skip signing when an AI coding agent is doing the committing.
 
-`mgit` handles all of this transparently. It is a single Python script with no dependencies beyond the Python standard library and stock `git`.
+`mgit` handles all of this transparently. It is a single Python script with **zero pip dependencies** — nothing beyond the Python standard library and stock `git`.
 
 ## Requirements
 
 - Python 3.6 or later
 - git (any stock version)
-- GPG configured for signing (required for human committers; see [Signing](#signing))
-- Linux or macOS — tested on CentOS 7 and Ubuntu 18+
+- GPG configured if you want signed commits (see [Signing](#signing))
+- Linux, macOS, or Windows — see [Windows](#windows)
 - `gh` (GitHub CLI) — required only for `mgit detach` and `mgit attach`; see [GitHub CLI](#github-cli)
 
 ## Installation
+
+### Linux / macOS
 
 ```bash
 curl -O https://raw.githubusercontent.com/blue-wind-25/mgit/main/mgit
@@ -30,6 +32,14 @@ Or clone the repo and symlink:
 git clone https://github.com/blue-wind-25/mgit.git
 sudo ln -s "$(pwd)/mgit/mgit" /usr/local/bin/mgit
 ```
+
+### Windows
+
+Download `mgit` and `mgit.cmd` from the repo, place both files in the same directory, and add that directory to your `PATH`. Open a new terminal and run `mgit` like any other command.
+
+Requirements on Windows:
+- [Python 3.6+](https://www.python.org/downloads/) — tick "Add Python to PATH" during install
+- [Git for Windows](https://gitforwindows.org/) — includes git, GPG, and sets `core.editor` for you
 
 ## Usage
 
@@ -47,6 +57,7 @@ mgit <command> [args...]
 | `mgit add [paths]` | Stage in all repos |
 | `mgit add -A` | Stage everything in all repos |
 | `mgit commit -m "msg"` | Commit all repos, leaves first, same message everywhere |
+| `mgit commit` | Commit all repos, opening an editor per repo for individual messages |
 | `mgit push` | Push all submodules, update refs in parent, push root |
 | `mgit pull` | Pull root, then sync and update all submodules |
 | `mgit fetch` | Fetch all repos |
@@ -69,7 +80,21 @@ mgit push
 
 `mgit commit` commits submodules first (bottom-up), then the root. Submodule ref pointers in the root are **not** updated until `mgit push`, keeping `commit` a local-only operation.
 
-`mgit push` then: pushes each submodule to its own remote, stages the updated ref pointers in the root, makes an automatic signed commit (`chore: update submodule refs`), and pushes the root.
+`mgit push` then: pushes each submodule to its own remote, stages the updated ref pointers in the root, makes an automatic commit (`chore: update submodule refs`), and pushes the root.
+
+### Per-repo commit messages
+
+Running `mgit commit` without `-m` opens your configured editor once per repo that has staged changes. Each editor session shows a comment header identifying the repo being committed:
+
+```
+# Please enter the commit message for: libs/crypto
+# Lines starting with '#' will be ignored.
+# An empty message aborts the commit for this repo.
+```
+
+Save and exit to commit that repo, leave the message empty to skip it. This mirrors git's own behaviour and lets you write meaningful per-repo messages without running git separately in each directory.
+
+The editor is resolved in this order: `GIT_EDITOR` → `core.editor` (git config) → `VISUAL` → `EDITOR` → `nano` (Linux/macOS) / `notepad` (Windows).
 
 ### Working from a subdirectory
 
@@ -95,7 +120,7 @@ mgit detach libs/crypto
 The sequence performed:
 
 1. Validates the subdir exists, is not already a submodule, and the working tree is clean
-2. Creates a temporary git repo, copies the subdir contents in, and commits with the same signing logic as the parent
+2. Creates a temporary git repo, copies the subdir contents in, and commits
 3. Creates the GitHub repo via `gh` and pushes
 4. Removes the subdir from the parent with `git rm -r`
 5. Adds the new repo back as a submodule
@@ -121,7 +146,7 @@ The sequence performed:
 
 1. Validates the subdir exists, the target is an existing submodule, and both repos have clean working trees
 2. Copies the subdir contents into the specified path inside the submodule
-3. Commits the addition inside the submodule (with signing logic)
+3. Commits the addition inside the submodule
 4. Removes the subdir from the parent and stages the updated submodule ref
 5. Commits the change in the parent
 
@@ -129,18 +154,28 @@ After `mgit attach`, run `mgit push` to push both repos.
 
 ## Signing
 
-GPG commit signing is **enforced by default** for all human committers. If no signing key is configured, `mgit commit` refuses with a clear error before touching anything.
-
-To configure signing:
+GPG commit signing is driven entirely by your git config — `mgit` does not inject or force signing. Configure it once and it applies everywhere:
 
 ```bash
 git config --global user.signingkey <YOUR_KEY_ID>
 git config --global commit.gpgsign true
 ```
 
+With `commit.gpgsign = true`, every `git commit` (and therefore every `mgit commit`) signs automatically. `mgit` performs a pre-flight check before committing: if signing is configured but GPG is misconfigured or the key is missing, it dies with a clear error before touching any repo.
+
+If `commit.gpgsign` is **not set**, `mgit` warns you before each unsigned commit and asks whether to continue:
+
+```
+[mgit] WARN: commit.gpgsign is not set for 'libs/crypto' — this commit will be unsigned.
+[mgit]       To enable signing: git config --global commit.gpgsign true
+Continue without signing? [Y/n]:
+```
+
+The default is yes, so pressing Enter proceeds. This makes it easy to notice missing signing config without blocking automated use.
+
 ### AI agent and bot exemptions
 
-`mgit` detects known AI coding agents and CI bots by their `git config user.email` and skips signing for them automatically. No configuration needed. The following are recognised out of the box:
+`mgit` detects known AI coding agents and CI bots by their `git config user.email` and explicitly suppresses signing for them via `--no-gpg-sign`, overriding any global `commit.gpgsign = true`. No configuration needed. The following are recognised out of the box:
 
 | Agent | Email pattern |
 |---|---|
@@ -151,29 +186,34 @@ git config --global commit.gpgsign true
 | Google Gemini | `218195315+gemini-cli@users.noreply.github.com`, `gemini-code-assist[bot]@...`, `noreply@gemini.google.com` |
 | Any GitHub bot | `*[bot]@users.noreply.github.com` (catch-all) |
 
-When signing is skipped, a log line is printed showing the matched email and pattern.
+When signing is suppressed, a log line is printed showing the matched email and pattern.
 
 To add your own CI or deploy bot emails, see [Configuration](#configuration).
 
 ## GitHub CLI
 
-`mgit detach` and `mgit attach` require the `gh` CLI to create and manage GitHub repositories. The other commands (`status`, `commit`, `push`, etc.) do not need it.
+`mgit detach` and `mgit attach` require the `gh` CLI to create and manage GitHub repositories. All other commands do not need it.
 
-If `gh` is not installed, `mgit` will print platform-appropriate installation instructions and exit — it will never install anything automatically.
-
-Install `gh`:
+If `gh` is not installed, `mgit` will print platform-appropriate instructions and exit — it never installs anything automatically.
 
 ```bash
 # macOS
 brew install gh
 
 # Debian / Ubuntu
-sudo apt install gh
+sudo apt update && sudo apt install gh
 
 # Fedora / CentOS
 sudo dnf install gh
 
-# Or download from https://github.com/cli/cli/releases/latest
+# Windows (winget)
+winget install --id GitHub.cli
+
+# Windows (Scoop)
+scoop install gh
+
+# All platforms — manual download
+# https://github.com/cli/cli/releases/latest
 ```
 
 After installing, authenticate once:
@@ -181,6 +221,27 @@ After installing, authenticate once:
 ```bash
 gh auth login
 ```
+
+## Windows
+
+`mgit` works on Windows with no code changes. Use `mgit.cmd` as the launcher:
+
+1. Install [Python 3.6+](https://www.python.org/downloads/) — tick "Add Python to PATH"
+2. Install [Git for Windows](https://gitforwindows.org/)
+3. Download `mgit` and `mgit.cmd` from this repo, place both in a folder on your PATH
+4. Open a new terminal and run `mgit` normally
+
+**Editor:** Git for Windows sets `core.editor` during install (vim, nano, VS Code, Notepad++, etc.). If nothing is configured, `mgit` falls back to `notepad`. Any editor that blocks until the file is closed will work.
+
+**GPG:** Git for Windows ships with GPG. If you use Gpg4win instead, point git at it:
+
+```
+git config --global gpg.program "C:\Program Files (x86)\GnuPG\bin\gpg.exe"
+```
+
+**Paths:** `mgit` uses `os.path` throughout, which handles Windows path separators correctly.
+
+**gh on Windows:** If `gh` is not found, `mgit` prints winget and Scoop install instructions and exits.
 
 ## Configuration
 
@@ -194,7 +255,11 @@ The first file found wins. Settings in the file **extend** the built-in defaults
 Copy `mgitconfig.sample` to get started:
 
 ```bash
+# Linux / macOS
 cp mgitconfig.sample ~/.mgitconfig
+
+# Windows
+copy mgitconfig.sample %USERPROFILE%\.mgitconfig
 ```
 
 ### Options
