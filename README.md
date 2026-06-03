@@ -341,12 +341,8 @@ When `mgit` calls `gh`, the token is resolved in this order:
 
 1. `[gh] token` in `.mgitconfig` / `~/.mgitconfig` → injected as `GH_TOKEN` into the subprocess
 2. `GH_TOKEN` environment variable already set → left as-is
-3. `GITHUB_TOKEN` environment variable set, but no `GH_TOKEN` or config token → **stripped** from the subprocess environment so gh falls through to the `gh auth login` credential (system keychain on macOS/Windows, `~/.config/gh/hosts.yml` on Linux)
+3. `GITHUB_TOKEN` environment variable set, but no `GH_TOKEN` or config token → mgit explicitly reads the keyring/`hosts.yml` token via `gh auth token` (with both env vars cleared) and injects it as `GH_TOKEN`, then removes `GITHUB_TOKEN`. This is necessary because gh records an active-account preference in `~/.config/gh/hosts.yml` and will use it even if `GITHUB_TOKEN` is merely absent from the env — explicitly injecting the keyring token as `GH_TOKEN` overrides that selection unambiguously.
 4. Nothing set → gh does its own resolution (keychain / `hosts.yml` / interactive prompt)
-
-Step 3 is intentional: `GH_TOKEN` is gh CLI's own preferred variable; `GITHUB_TOKEN` is the conventional name used by API clients, GitHub Actions, and SDKs. When only `GITHUB_TOKEN` is present it is almost always a fine-grained token scoped for API work, not suitable for `gh` org/repo operations. Stripping it lets `gh auth login` credentials work transparently without any extra configuration.
-
-If none of these are present and `gh auth login` has not been run, `gh` will prompt interactively or fail.
 
 ### Coexistence with `GITHUB_TOKEN`
 

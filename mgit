@@ -32,7 +32,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -514,6 +514,29 @@ def require_gh() -> None:
         offer_gh_install()
 
 
+def _gh_keyring_token() -> str:
+    """
+    Return the token stored by 'gh auth login' in the system keyring /
+    hosts.yml, bypassing any GITHUB_TOKEN / GH_TOKEN env vars.
+
+    Runs gh with both token env vars cleared so gh falls through to its
+    stored credential, then reads the token via 'gh auth token'.
+    Returns '' if no stored credential exists.
+    """
+    env = os.environ.copy()
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GH_TOKEN", None)
+    result = subprocess.run(
+        ["gh", "auth", "token"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env=env
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return ""
+
+
 def _gh_env() -> dict:
     """
     Return an environment dict for gh subprocesses, handling the common
@@ -530,13 +553,13 @@ def _gh_env() -> dict:
        Leave everything alone — the caller set it deliberately.
 
     3. GITHUB_TOKEN set but no GH_TOKEN / config token
-       Strip GITHUB_TOKEN from the subprocess environment so gh falls
-       through to the credential stored by 'gh auth login' (system
-       keychain on macOS/Windows, ~/.config/gh/hosts.yml on Linux).
-       Rationale: GH_TOKEN is gh CLI's own preferred variable; GITHUB_TOKEN
-       is the conventional name for API tokens (GitHub Actions, SDKs, etc.).
-       When only GITHUB_TOKEN is present it is almost always a fine-grained
-       token scoped for API work, not for gh CLI org/repo operations.
+       gh may have multiple accounts and marks the GITHUB_TOKEN one as
+       active in its config, so simply deleting GITHUB_TOKEN from the env
+       is not enough — gh still picks up the active-account setting from
+       ~/.config/gh/hosts.yml. Instead, explicitly read the keyring token
+       via 'gh auth token' (with both env vars cleared) and inject it as
+       GH_TOKEN so gh uses the stored classic PAT unambiguously.
+       If no keyring token exists, fall through to case 4.
 
     4. Neither token set
        Leave the environment alone; gh does its own resolution (keychain,
@@ -555,9 +578,17 @@ def _gh_env() -> dict:
 
     if env.get("GITHUB_TOKEN"):
         # GITHUB_TOKEN present but no gh-specific token configured.
-        # Remove it so gh falls through to the gh auth login credential
-        # rather than using what is almost certainly a fine-grained API token.
-        del env["GITHUB_TOKEN"]
+        # Explicitly fetch the keyring/hosts.yml token and inject it as
+        # GH_TOKEN so gh doesn't fall back to the active-account setting
+        # which may still point at the fine-grained GITHUB_TOKEN credential.
+        keyring_token = _gh_keyring_token()
+        if keyring_token:
+            env["GH_TOKEN"] = keyring_token
+            del env["GITHUB_TOKEN"]
+        else:
+            # No keyring token — strip GITHUB_TOKEN anyway and let gh
+            # handle it (it will prompt or fail with a clear error).
+            del env["GITHUB_TOKEN"]
 
     return env
 
