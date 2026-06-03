@@ -112,10 +112,11 @@ mgit detach libs/crypto
 
 `mgit` will interactively ask for:
 
+- **Owner** — your personal account or any GitHub organisation you belong to (prompted when org memberships are detected; see [Owner selection](#owner-selection) below)
 - **New repo name** — defaults to the subdirectory basename
 - **Description** — optional, passed to `gh repo create`
 - **Visibility** — public or private
-- **Initial commit message** — whether to include the parent repo name (a privacy warning is shown if the parent is private and the new repo is public)
+- **Initial commit message** — whether to include the parent repo name (a privacy warning is shown for public repos)
 
 The sequence performed:
 
@@ -127,6 +128,38 @@ The sequence performed:
 6. Commits the change in the parent
 
 After `mgit detach`, run `mgit push` to push both repos to their remotes.
+
+#### Owner selection
+
+When `mgit detach` runs, it fetches the authenticated GitHub user's login and their organisation memberships. If the user belongs to one or more organisations, a numbered menu is shown:
+
+```
+[mgit] Where should the new repo be created?
+   1. blue-wind-25 (personal)
+   2. my-org (org)
+   3. another-org (org)
+
+Select owner [1-3] [1]:
+```
+
+Select `1` to create the new repo under your personal account, or choose an org number to create it there. If you belong to no organisations, the personal account is used automatically with no prompt.
+
+The personal account is always the currently authenticated `gh` user — never inferred from the current repo's remote URL.
+
+#### Ownership combinations
+
+`mgit detach` and `mgit attach` work with all combinations of personal and org ownership for both the current repo and the new/target repo:
+
+| Current repo owner | New / target repo owner | `detach` | `attach` |
+|---|---|---|---|
+| Personal | Personal | ✅ | ✅ |
+| Personal | Org | ✅ | ✅ |
+| Org | Personal | ✅ | ✅ |
+| Org | Org | ✅ | ✅ |
+
+For `detach`, the owner of the new repo is chosen at the prompt — it is independent of who owns the current repo. For `attach`, no new repo is created and ownership is irrelevant; only local git operations are performed.
+
+**Token requirement for org repos:** creating a repo in an organisation requires a classic personal access token with `repo` and `read:org` scopes. Fine-grained tokens cannot list org memberships or create org repos. See [GitHub CLI authentication](#github-cli-authentication) below.
 
 #### Nested detach
 
@@ -151,6 +184,171 @@ The sequence performed:
 5. Commits the change in the parent
 
 After `mgit attach`, run `mgit push` to push both repos.
+
+`attach` performs only local git operations — it does not call `gh` and does not require any GitHub token.
+
+## GitHub CLI
+
+`mgit detach` requires the `gh` CLI to create and manage GitHub repositories. `mgit attach` does not need it. All other commands do not need it.
+
+If `gh` is not installed, `mgit` will print platform-appropriate instructions and exit — it never installs anything automatically.
+
+```bash
+# macOS
+brew install gh
+
+# Debian / Ubuntu
+sudo apt update && sudo apt install gh
+
+# Fedora / CentOS
+sudo dnf install gh
+
+# Windows (winget)
+winget install --id GitHub.cli
+
+# Windows (Scoop)
+scoop install gh
+
+# All platforms — manual download
+# https://github.com/cli/cli/releases/latest
+```
+
+## GitHub CLI authentication
+
+`mgit detach` uses `gh` to create repos and list org memberships. `gh` has its own authentication layer, separate from git's credential system (SSH keys, HTTPS credential helpers). There are three ways to authenticate it.
+
+### Token requirements
+
+`mgit detach` calls two GitHub APIs:
+
+- `gh org list` — lists organisations the authenticated user belongs to (`read:org` scope)
+- `gh repo create` — creates a repository under a personal account or org (`repo` scope)
+
+These operations require a **classic personal access token** with scopes `repo`, `read:org`, and `gist`.
+
+**Fine-grained personal access tokens do not work** for `mgit detach` when org repos are involved. Fine-grained tokens cannot list org memberships or create repositories in organisations. They will work for personal-to-personal detach only, but mgit will still fail to show the org menu and will silently skip org options.
+
+If you attempt `mgit detach` with a fine-grained token and an org operation is needed, `gh` will return HTTP 403. mgit catches this and prints a clear error with remediation steps.
+
+### Authentication options
+
+#### Option A — `gh auth login` (recommended for most users)
+
+Run once. Credentials are stored in your system keychain (macOS) / Windows Credential Manager / `~/.config/gh/hosts.yml` (Linux). mgit picks them up automatically.
+
+```bash
+gh auth login
+# Choose: GitHub.com → HTTPS → Paste an authentication token
+# Paste your classic PAT when prompted
+```
+
+`gh auth login` stores credentials in its own config file — it does **not** read or write `GITHUB_TOKEN` or `GH_TOKEN` in your environment. Your existing env vars are completely unaffected.
+
+#### Option B — `GH_TOKEN` environment variable (session-scoped)
+
+Set `GH_TOKEN` to your classic PAT. `gh` checks `GH_TOKEN` before `GITHUB_TOKEN`, so this lets you keep a fine-grained token in `GITHUB_TOKEN` for your own API work while giving `gh` a different token:
+
+```bash
+# Linux / macOS — current session only
+export GH_TOKEN=ghp_yourclassictoken
+
+# Windows cmd
+set GH_TOKEN=ghp_yourclassictoken
+
+# Windows PowerShell
+$env:GH_TOKEN = 'ghp_yourclassictoken'
+```
+
+Or inline for a single command:
+
+```bash
+GH_TOKEN=ghp_yourclassictoken mgit detach libs/crypto
+```
+
+#### Option C — `[gh] token` in `~/.mgitconfig` (persistent, recommended if `GITHUB_TOKEN` is already in use)
+
+If you already have `GITHUB_TOKEN` set in your environment for other purposes (e.g. a fine-grained PAT for your own API), use this option. mgit injects the token as `GH_TOKEN` into `gh` subprocesses only — your `GITHUB_TOKEN` is never read or modified.
+
+```ini
+# ~/.mgitconfig
+[gh]
+token = ghp_yourclassictoken
+```
+
+`GH_TOKEN` takes precedence over `GITHUB_TOKEN` in gh's own resolution order, so this correctly overrides your environment's fine-grained token for all mgit gh calls.
+
+### How to find or create a classic PAT
+
+**Create a new classic PAT:**
+
+1. Go to [https://github.com/settings/tokens](https://github.com/settings/tokens)
+2. Click **Generate new token (classic)**
+3. Set an expiry and a descriptive name (e.g. `mgit-detach`)
+4. Select scopes: **repo**, **read:org**, **gist**
+5. Click **Generate token** and copy it immediately
+
+**Copy from `gh auth login` stored credentials (Linux only):**
+
+If you previously ran `gh auth login` and want to move that token into `~/.mgitconfig`:
+
+```bash
+# The token is in hosts.yml if gh did not use the system keychain
+grep oauth_token ~/.config/gh/hosts.yml
+```
+
+On macOS and Windows, `gh auth login` stores to the system keychain / Credential Manager rather than `hosts.yml`, so the token is not directly readable from a file. In that case, retrieve the token gh is using:
+
+```bash
+gh auth token
+```
+
+Then paste the output into `~/.mgitconfig`:
+
+```ini
+[gh]
+token = ghp_the_token_printed_above
+```
+
+### Authentication resolution order
+
+When `mgit` calls `gh`, the token is resolved in this order:
+
+1. `[gh] token` in `.mgitconfig` / `~/.mgitconfig` → injected as `GH_TOKEN` into the subprocess
+2. `GH_TOKEN` environment variable already set → left as-is
+3. `GITHUB_TOKEN` environment variable set, but no `GH_TOKEN` or config token → **stripped** from the subprocess environment so gh falls through to the `gh auth login` credential (system keychain on macOS/Windows, `~/.config/gh/hosts.yml` on Linux)
+4. Nothing set → gh does its own resolution (keychain / `hosts.yml` / interactive prompt)
+
+Step 3 is intentional: `GH_TOKEN` is gh CLI's own preferred variable; `GITHUB_TOKEN` is the conventional name used by API clients, GitHub Actions, and SDKs. When only `GITHUB_TOKEN` is present it is almost always a fine-grained token scoped for API work, not suitable for `gh` org/repo operations. Stripping it lets `gh auth login` credentials work transparently without any extra configuration.
+
+If none of these are present and `gh auth login` has not been run, `gh` will prompt interactively or fail.
+
+### Coexistence with `GITHUB_TOKEN`
+
+If you have `GITHUB_TOKEN` set in your environment for API work and have run `gh auth login` with a classic PAT, **no extra configuration is needed**. mgit automatically strips `GITHUB_TOKEN` from the environment it passes to `gh`, so `gh` falls through to the stored `gh auth login` credential.
+
+```bash
+# In your shell profile — fine-grained PAT for your API
+export GITHUB_TOKEN=github_pat_yourfinegrainedtoken
+
+# Run once — classic PAT stored in keychain / gh config
+gh auth login   # paste classic PAT with repo, read:org, gist scopes
+
+# mgit detach just works — no GH_TOKEN or [gh] token needed
+mgit detach libs/crypto
+```
+
+Use the `[gh] token` config option only if you cannot or prefer not to run `gh auth login`, or if you want an explicit token that is not tied to the keychain:
+
+```ini
+# ~/.mgitconfig
+[gh]
+token = ghp_yourclassictoken   # classic PAT — injected as GH_TOKEN for gh calls only
+```
+
+```bash
+# In your shell profile
+export GITHUB_TOKEN=github_pat_yourfinegrainedtoken   # used by your API, stripped for gh
+```
 
 ## Signing
 
@@ -190,38 +388,6 @@ When signing is suppressed, a log line is printed showing the matched email and 
 
 To add your own CI or deploy bot emails, see [Configuration](#configuration).
 
-## GitHub CLI
-
-`mgit detach` and `mgit attach` require the `gh` CLI to create and manage GitHub repositories. All other commands do not need it.
-
-If `gh` is not installed, `mgit` will print platform-appropriate instructions and exit — it never installs anything automatically.
-
-```bash
-# macOS
-brew install gh
-
-# Debian / Ubuntu
-sudo apt update && sudo apt install gh
-
-# Fedora / CentOS
-sudo dnf install gh
-
-# Windows (winget)
-winget install --id GitHub.cli
-
-# Windows (Scoop)
-scoop install gh
-
-# All platforms — manual download
-# https://github.com/cli/cli/releases/latest
-```
-
-After installing, authenticate once:
-
-```bash
-gh auth login
-```
-
 ## Windows
 
 `mgit` works on Windows with no code changes. Use `mgit.cmd` as the launcher:
@@ -241,7 +407,7 @@ git config --global gpg.program "C:\Program Files (x86)\GnuPG\bin\gpg.exe"
 
 **Paths:** `mgit` uses `os.path` throughout, which handles Windows path separators correctly.
 
-**gh on Windows:** If `gh` is not found, `mgit` prints winget and Scoop install instructions and exits.
+**gh on Windows:** If `gh` is not found, `mgit` prints winget and Scoop install instructions and exits. For the `[gh] token` option, use your user-global `~/.mgitconfig` — on Windows this resolves to `%USERPROFILE%\.mgitconfig`.
 
 ## Configuration
 
@@ -280,6 +446,13 @@ commit_msg = "chore: update submodule refs"
 [behavior]
 # Print every git command being run.
 verbose = false
+
+[gh]
+# Classic personal access token for gh CLI (detach only).
+# Required scopes: repo, read:org, gist
+# Injected as GH_TOKEN into gh subprocesses — does not affect GITHUB_TOKEN.
+# Use this if GITHUB_TOKEN is already set in your environment for other purposes.
+# token = ghp_yourclassictoken
 ```
 
 ### Verbose mode

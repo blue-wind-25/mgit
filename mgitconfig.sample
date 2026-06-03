@@ -24,3 +24,26 @@
 [behavior]
 # Set to true to enable verbose logging of every git command invoked.
 # verbose = false
+
+[gh]
+# Classic personal access token for gh CLI (used by mgit detach and attach).
+#
+# Required scopes: repo, read:org, gist
+# Create one at: https://github.com/settings/tokens
+#
+# This token is injected as GH_TOKEN into gh subprocesses only.
+# It does not affect GITHUB_TOKEN in your environment, so a fine-grained
+# token you use for your own API work is left completely untouched.
+#
+# Use this option if you already have GITHUB_TOKEN set in your environment
+# for other purposes and do not want mgit to interfere with it.
+#
+# Alternatives (no config file needed):
+#   gh auth login        — stores credentials in your system keychain /
+#                          gh config file; picked up automatically
+#   export GH_TOKEN=...  — overrides GITHUB_TOKEN for the current session
+#
+# Note: fine-grained personal access tokens cannot list org memberships
+# or create repositories in organisations. Use a classic token here.
+#
+# token = ghp_yourclassictoken

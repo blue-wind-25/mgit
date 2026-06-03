@@ -32,7 +32,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.2.1"
+VERSION = "1.3.1"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -76,6 +76,7 @@ class MgitConfig:
         self.ref_commit_msg: str = DEFAULT_REF_COMMIT_MSG
         self.no_sign_emails: List[str] = list(DEFAULT_NO_SIGN_EMAILS)
         self.verbose: bool = False
+        self.gh_token: str = ""   # classic PAT for gh CLI (detach/attach)
         self._load()
 
     def _load(self) -> None:
@@ -99,6 +100,9 @@ class MgitConfig:
 
         if parser.has_option("behavior", "verbose"):
             self.verbose = parser.getboolean("behavior", "verbose")
+
+        if parser.has_option("gh", "token"):
+            self.gh_token = parser.get("gh", "token").strip('"\'').strip()
 
 
 CONFIG = MgitConfig()
@@ -479,8 +483,27 @@ def offer_gh_install() -> None:
         print("  Download from: https://github.com/cli/cli/releases/latest")
 
     print()
-    print("  After installing, authenticate with: gh auth login")
-    print("  Then re-run your mgit command.")
+    print("  After installing, authenticate with one of the following methods:")
+    print()
+    print("  Option A — gh auth login (interactive, recommended):")
+    print("      gh auth login")
+    print("      Choose: GitHub.com → HTTPS → Paste an authentication token")
+    print("      Use a classic personal access token with scopes: repo, read:org, gist")
+    print("      This stores credentials in your system keychain / gh config file.")
+    print("      mgit's detach and attach commands will use them automatically.")
+    print()
+    print("  Option B — GH_TOKEN environment variable (session-only):")
+    print("      export GH_TOKEN=ghp_yourclassictoken   # Linux / macOS")
+    print("      set GH_TOKEN=ghp_yourclassictoken      # Windows cmd")
+    print("      $env:GH_TOKEN='ghp_yourclassictoken'   # Windows PowerShell")
+    print()
+    print("  Option C — [gh] token in ~/.mgitconfig (persistent, recommended")
+    print("             if you already use GITHUB_TOKEN for other purposes):")
+    print("      [gh]")
+    print("      token = ghp_yourclassictoken")
+    print()
+    print("  Note: fine-grained personal access tokens cannot create org repos")
+    print("  or list org memberships. Use a classic token for detach/attach.")
     print()
     sys.exit(1)
 
@@ -491,22 +514,125 @@ def require_gh() -> None:
         offer_gh_install()
 
 
+def _gh_env() -> dict:
+    """
+    Return an environment dict for gh subprocesses, handling the common
+    situation where GITHUB_TOKEN holds a fine-grained PAT for API use
+    while gh CLI needs a classic PAT with repo + read:org scopes.
+
+    Resolution order:
+
+    1. [gh] token in .mgitconfig / ~/.mgitconfig
+       Inject as GH_TOKEN (beats GITHUB_TOKEN in gh's own priority order).
+       This is the recommended option when GITHUB_TOKEN is already in use.
+
+    2. GH_TOKEN already set in the environment
+       Leave everything alone — the caller set it deliberately.
+
+    3. GITHUB_TOKEN set but no GH_TOKEN / config token
+       Strip GITHUB_TOKEN from the subprocess environment so gh falls
+       through to the credential stored by 'gh auth login' (system
+       keychain on macOS/Windows, ~/.config/gh/hosts.yml on Linux).
+       Rationale: GH_TOKEN is gh CLI's own preferred variable; GITHUB_TOKEN
+       is the conventional name for API tokens (GitHub Actions, SDKs, etc.).
+       When only GITHUB_TOKEN is present it is almost always a fine-grained
+       token scoped for API work, not for gh CLI org/repo operations.
+
+    4. Neither token set
+       Leave the environment alone; gh does its own resolution (keychain,
+       hosts.yml, interactive prompt).
+    """
+    env = os.environ.copy()
+
+    if CONFIG.gh_token:
+        # Explicit token in .mgitconfig — takes priority over everything.
+        env["GH_TOKEN"] = CONFIG.gh_token
+        return env
+
+    if env.get("GH_TOKEN"):
+        # Caller deliberately set GH_TOKEN — leave it alone.
+        return env
+
+    if env.get("GITHUB_TOKEN"):
+        # GITHUB_TOKEN present but no gh-specific token configured.
+        # Remove it so gh falls through to the gh auth login credential
+        # rather than using what is almost certainly a fine-grained API token.
+        del env["GITHUB_TOKEN"]
+
+    return env
+
+
+def _gh_explain_403(stderr_text: str) -> None:
+    """
+    If gh stderr contains a 403 / permission error, print an actionable
+    explanation and exit. Called by run_gh when gh returns non-zero.
+    """
+    text = stderr_text.lower()
+    if "403" in text or "forbidden" in text or "resource not accessible" in text \
+            or "token cannot" in text or "must have push access" in text \
+            or "not found" in text:
+        print()
+        error("GitHub API returned a permission error (HTTP 403 / 404).")
+        print("[mgit]", file=sys.stderr)
+        print("[mgit] Possible causes:", file=sys.stderr)
+        print("[mgit]   1. The token being used is a fine-grained personal access token.", file=sys.stderr)
+        print("[mgit]      Fine-grained tokens cannot create org repos or list org", file=sys.stderr)
+        print("[mgit]      memberships. Use a classic token with repo + read:org scopes.", file=sys.stderr)
+        print("[mgit]", file=sys.stderr)
+        print("[mgit]   2. No gh token is configured and GITHUB_TOKEN in your environment", file=sys.stderr)
+        print("[mgit]      is a fine-grained token scoped for other purposes.", file=sys.stderr)
+        print("[mgit]", file=sys.stderr)
+        print("[mgit] Fix — add a classic token to ~/.mgitconfig:", file=sys.stderr)
+        print("[mgit]      [gh]", file=sys.stderr)
+        print("[mgit]      token = ghp_yourclassictoken", file=sys.stderr)
+        print("[mgit]", file=sys.stderr)
+        print("[mgit] Or set GH_TOKEN for this session only:", file=sys.stderr)
+        print("[mgit]      export GH_TOKEN=ghp_yourclassictoken   # Linux / macOS", file=sys.stderr)
+        print("[mgit]      $env:GH_TOKEN='ghp_yourclassictoken'   # Windows PowerShell", file=sys.stderr)
+        print("[mgit]", file=sys.stderr)
+        print("[mgit] Classic token scopes required: repo, read:org, gist", file=sys.stderr)
+        print("[mgit] Create one at: https://github.com/settings/tokens", file=sys.stderr)
+        print(file=sys.stderr)
+        sys.exit(1)
+
+
 def run_gh(args: List[str], check: bool = True,
            capture: bool = False) -> subprocess.CompletedProcess:
-    """Run gh with given args."""
+    """
+    Run gh with given args.
+
+    If [gh] token is set in .mgitconfig, it is injected as GH_TOKEN into
+    the subprocess environment so that gh uses the classic PAT for all
+    detach/attach operations, regardless of any GITHUB_TOKEN that may be
+    set in the caller's environment for other purposes.
+    """
     cmd = ["gh"] + args
     verbose("  $ {}".format(" ".join(cmd)))
+    env = _gh_env()
     if capture:
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            universal_newlines=True
+            universal_newlines=True,
+            env=env
         )
     else:
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, env=env)
     if check and result.returncode != 0:
         if capture:
             sys.stderr.write(result.stderr)
+            _gh_explain_403(result.stderr)
+        else:
+            # Re-run capturing stderr so we can inspect it for 403
+            result2 = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
+                env=env
+            )
+            if result2.stderr:
+                sys.stderr.write(result2.stderr)
+            _gh_explain_403(result2.stderr)
         sys.exit(result.returncode)
     return result
 
@@ -538,9 +664,81 @@ def repo_name_from_url(url: str) -> str:
     return parts[-1] if parts else ""
 
 
+def repo_owner_from_url(url: str) -> str:
+    """
+    Extract the owner (user or org) from a remote URL.
+    Handles both https://github.com/owner/name.git and git@github.com:owner/name.git.
+    Returns '' if parsing fails.
+    """
+    if not url:
+        return ""
+    url = re.sub(r"\.git$", "", url)
+    parts = [p for p in re.split(r"[/:]", url) if p]
+    # parts looks like: ['github.com', 'owner', 'name']
+    return parts[-2] if len(parts) >= 2 else ""
+
+
 def gh_repo_owner() -> str:
     """Return the authenticated GitHub username via gh, or ''."""
     return gh_output(["api", "user", "--jq", ".login"])
+
+
+def gh_user_orgs() -> List[str]:
+    """
+    Return a list of org login names that the authenticated user belongs to.
+    Returns [] if the user has no org memberships or if the token does not
+    have read:org scope (e.g. a fine-grained PAT).
+    """
+    result = run_gh(
+        ["org", "list", "--limit", "100", "--json", "login", "--jq", ".[].login"],
+        check=False, capture=True
+    )
+    if result.returncode != 0:
+        # Token may lack read:org — silently return empty; caller handles it.
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def gh_get_owner(cwd: str = None) -> str:
+    """
+    Determine the GitHub owner (user or org) for a new repository.
+
+    - Fetches the authenticated user's login and their org memberships.
+    - If the user has no org memberships, returns their personal login
+      immediately without prompting.
+    - Otherwise presents a numbered menu: personal account first, then
+      each org, and returns the selected login.
+
+    Personal is always the authenticated gh user — never inferred from
+    the current repo's remote URL.
+    """
+    gh_user = gh_repo_owner()
+    if not gh_user:
+        die("Could not determine authenticated GitHub user. "
+            "Check that gh is authenticated (gh auth status).")
+
+    orgs = gh_user_orgs()
+
+    if not orgs:
+        return gh_user
+
+    choices = [gh_user] + orgs
+    print()
+    info("Where should the new repo be created?")
+    for i, name in enumerate(choices, 1):
+        label = "(personal)" if i == 1 else "(org)"
+        print("  {:2d}. {} {}".format(i, name, label), file=sys.stderr)
+    print(file=sys.stderr)
+
+    while True:
+        raw = prompt("Select owner [1-{}]".format(len(choices)), default="1")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(choices):
+                return choices[idx]
+        except ValueError:
+            pass
+        warn("Please enter a number between 1 and {}.".format(len(choices)))
 
 # ---------------------------------------------------------------------------
 # Shared commit helper
@@ -590,6 +788,15 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     for it, and re-add it as a submodule.
 
     Usage: mgit detach <subdir>
+
+    The new repo can be created under the authenticated user's personal
+    account or any GitHub organisation they belong to. mgit prompts for
+    the owner when org memberships are detected.
+
+    Token requirements for gh CLI:
+      - Classic personal access token with scopes: repo, read:org, gist
+      - Fine-grained tokens cannot list org memberships or create org repos.
+    See README.md § "GitHub CLI authentication" for setup options.
     """
     if not extra_args:
         die("Usage: mgit detach <subdir>\n"
@@ -624,8 +831,11 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     print()
     info("Detaching '{}' from '{}' into a new GitHub repo.".format(
         subdir_rel, parent_name))
-    print()
 
+    # Determine owner — personal account or an org
+    owner = gh_get_owner(cwd=root)
+
+    print()
     repo_name = prompt("New repo name", default=os.path.basename(subdir_rel))
     repo_desc = prompt("Description (optional)", default="")
     is_public = prompt_yes_no("Make the new repo public?", default=True)
@@ -644,10 +854,12 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     else:
         initial_commit_msg = "chore: initial commit — split from {}".format(subdir_rel)
 
+    qualified_name = "{}/{}".format(owner, repo_name)
+
     print()
     info("Summary:")
     info("  Subdir      : {}".format(subdir_rel))
-    info("  New repo    : {}".format(repo_name))
+    info("  New repo    : {}".format(qualified_name))
     info("  Visibility  : {}".format("public" if is_public else "private"))
     info("  Initial msg : {}".format(initial_commit_msg))
     print()
@@ -687,18 +899,17 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
         do_commit(tmpdir, "(new repo)", initial_commit_msg, skip_sign, reason)
 
         # Create GitHub repo and push
-        info("Creating GitHub repo '{}'...".format(repo_name))
+        info("Creating GitHub repo '{}'...".format(qualified_name))
         visibility_flag = "--public" if is_public else "--private"
-        gh_args = ["repo", "create", repo_name, visibility_flag,
+        gh_args = ["repo", "create", qualified_name, visibility_flag,
                    "--source", tmpdir, "--remote", "origin", "--push"]
         if repo_desc:
             gh_args += ["--description", repo_desc]
         run_gh(gh_args)
 
         new_repo_url = gh_output(
-            ["repo", "view", repo_name, "--json", "sshUrl", "--jq", ".sshUrl"])
+            ["repo", "view", qualified_name, "--json", "sshUrl", "--jq", ".sshUrl"])
         if not new_repo_url:
-            owner = gh_repo_owner()
             new_repo_url = "git@github.com:{}/{}.git".format(owner, repo_name)
         info("New repo URL: {}".format(new_repo_url))
 
@@ -739,6 +950,10 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
     then remove the subdir from the parent.
 
     Usage: mgit attach <subdir> <submodule-path>
+
+    Works regardless of whether the parent repo or the target submodule
+    is owned by a personal account or an organisation — no gh API calls
+    are made; only local git operations are performed.
     """
     if len(extra_args) < 2:
         die("Usage: mgit attach <subdir> <submodule-path>\n"
@@ -943,10 +1158,6 @@ def cmd_commit(root: str, extra_args: List[str]) -> None:
         info("=== commit: {} ===".format(rel))
 
         if has_msg:
-            # -m supplied: extract the message value and route through do_commit
-            # so the unsigned-commit warning fires consistently.
-            # We reconstruct the message from the args rather than duplicating
-            # the signing logic here.
             msg_value = _extract_message(extra_args)
             skip_sign, reason = should_skip_signing(cwd=repo)
             if not do_commit(repo, rel, msg_value, skip_sign, reason):
@@ -1057,12 +1268,18 @@ def main() -> None:
         print("Supported multi-repo commands:")
         print("  status, add, commit [-m \"msg\"], push, pull, fetch, diff, log")
         print()
-        print("Submodule management:")
+        print("Submodule management (requires gh CLI):")
         print("  detach <subdir>                  — extract subdir into new GitHub repo, re-add as submodule")
         print("  attach <subdir> <submodule-path> — move subdir contents into an existing submodule")
         print()
         print("Any other git command is passed through to all repos.")
         print("Run from any directory inside a git repo.")
+        print()
+        print("gh authentication (detach/attach only):")
+        print("  Requires a classic PAT with scopes: repo, read:org, gist")
+        print("  Set via gh auth login, GH_TOKEN env var, or [gh] token in ~/.mgitconfig")
+        print("  Fine-grained tokens cannot list org memberships or create org repos.")
+        print("  See README.md § 'GitHub CLI authentication' for full details.")
         sys.exit(0)
 
     if sys.argv[1] in ("--version", "-V"):
