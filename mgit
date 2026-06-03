@@ -150,6 +150,36 @@ def prompt_yes_no(msg: str, default: bool = True) -> bool:
         return default
     return answer in ("y", "yes")
 
+def prompt_yes_no_sign(rel: str) -> str:
+    """
+    Prompt the user when commit.gpgsign is not set.
+    Returns one of:
+      'yes'       — proceed unsigned this time
+      'no'        — skip this commit
+      'configure' — set commit.gpgsign=true globally and sign from now on
+    """
+    print("[mgit] WARN: commit.gpgsign is not set for '{}' — "
+          "this commit will be unsigned.".format(rel), file=sys.stderr)
+    print("[mgit]", file=sys.stderr)
+    print("[mgit]   y  continue without signing (this commit only)", file=sys.stderr)
+    print("[mgit]   n  skip this commit", file=sys.stderr)
+    print("[mgit]   c  enable signing globally (git config --global commit.gpgsign true)", file=sys.stderr)
+    print("[mgit]      and sign this commit", file=sys.stderr)
+    print("[mgit]", file=sys.stderr)
+    while True:
+        try:
+            answer = input("[mgit] Choice [Y/n/c]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            die("Aborted.")
+        if answer in ("", "y", "yes"):
+            return "yes"
+        if answer in ("n", "no"):
+            return "no"
+        if answer in ("c", "configure"):
+            return "configure"
+        warn("Please enter y, n, or c.")
+
 # ---------------------------------------------------------------------------
 # Git subprocess helpers
 # ---------------------------------------------------------------------------
@@ -517,23 +547,57 @@ def require_gh() -> None:
 def _gh_keyring_token() -> str:
     """
     Return the token stored by 'gh auth login' in the system keyring /
-    hosts.yml, bypassing any GITHUB_TOKEN / GH_TOKEN env vars.
+    hosts.yml, bypassing the active-account preference that gh records in
+    its config when GITHUB_TOKEN is set in the environment.
 
-    Runs gh with both token env vars cleared so gh falls through to its
-    stored credential, then reads the token via 'gh auth token'.
-    Returns '' if no stored credential exists.
+    Strategy: run 'gh auth status' with both token env vars cleared to
+    enumerate stored accounts, find one that has read:org scope (i.e. the
+    classic PAT stored by gh auth login), then read its token via
+    'gh auth token --user <login>'.
+
+    Returns '' if no suitable stored credential is found.
     """
-    env = os.environ.copy()
-    env.pop("GITHUB_TOKEN", None)
-    env.pop("GH_TOKEN", None)
-    result = subprocess.run(
-        ["gh", "auth", "token"],
+    clean_env = os.environ.copy()
+    clean_env.pop("GITHUB_TOKEN", None)
+    clean_env.pop("GH_TOKEN", None)
+
+    # Get the list of stored accounts and their scopes
+    status = subprocess.run(
+        ["gh", "auth", "status"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         universal_newlines=True,
-        env=env
+        env=clean_env
     )
-    if result.returncode == 0:
-        return result.stdout.strip()
+    # gh auth status writes to stderr
+    output = status.stderr + status.stdout
+
+    # Parse blocks like:
+    #   github.com
+    #     ✓ Logged in to github.com account blue-wind-25 (keyring)
+    #     - Token scopes: 'gist', 'read:org', 'repo'
+    # We want the account that has read:org in its scopes.
+    current_user = None
+    for line in output.splitlines():
+        line = line.strip()
+        # Match account line — extract username
+        m = re.search(r"Logged in to \S+ account (\S+)", line)
+        if m:
+            current_user = m.group(1).rstrip(")")
+            continue
+        # Check scopes line for read:org
+        if current_user and "token scopes" in line.lower() and "read:org" in line:
+            # Found an account with read:org — get its token
+            token_result = subprocess.run(
+                ["gh", "auth", "token", "--user", current_user],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
+                env=clean_env
+            )
+            if token_result.returncode == 0:
+                token = token_result.stdout.strip()
+                if token:
+                    return token
+
     return ""
 
 
@@ -719,15 +783,30 @@ def gh_user_orgs() -> List[str]:
     Return a list of org login names that the authenticated user belongs to.
     Returns [] if the user has no org memberships or if the token does not
     have read:org scope (e.g. a fine-grained PAT).
+
+    Uses plain 'gh org list' without --json since the --json flag was added
+    in a later version of gh and is not universally available.
+    The plain output is one org login per line (with an optional header line
+    like "Showing 2 of 2 organizations" which is filtered out).
     """
     result = run_gh(
-        ["org", "list", "--limit", "100", "--json", "login", "--jq", ".[].login"],
+        ["org", "list", "--limit", "100"],
         check=False, capture=True
     )
     if result.returncode != 0:
-        # Token may lack read:org — silently return empty; caller handles it.
         return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    orgs = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Skip the summary header line gh prints before the list
+        if line.lower().startswith("showing ") and " organization" in line.lower():
+            continue
+        if line.lower() == "there are no organizations":
+            return []
+        orgs.append(line)
+    return orgs
 
 
 def gh_get_owner(cwd: str = None) -> str:
@@ -781,8 +860,12 @@ def do_commit(repo: str, rel: str, msg: str, is_bot: bool,
     Run git commit in repo. Signing is driven by git config (commit.gpgsign);
     mgit's only role is to suppress it for known bots via --no-gpg-sign.
 
-    Returns True if the commit was made, False if the user chose to skip
-    (only possible when gpgsign is unset and the user declines to continue).
+    When commit.gpgsign is not set, prompts the user with three options:
+      y — proceed unsigned this time
+      n — skip this commit (returns False)
+      c — enable commit.gpgsign globally and sign this commit
+
+    Returns True if the commit was made, False if the user chose to skip.
     """
     if is_bot:
         info("Signing suppressed for {}: {}".format(rel, bot_reason))
@@ -798,14 +881,21 @@ def do_commit(repo: str, rel: str, msg: str, is_bot: bool,
         return True
 
     # commit.gpgsign is not set — commits will be unsigned.
-    # Warn the human and ask whether to proceed. Default is yes so that
-    # automated / non-interactive use (e.g. pipes) continues safely.
-    warn("commit.gpgsign is not set for '{}' — this commit will be unsigned.".format(rel))
-    print("[mgit]        To enable signing: git config --global commit.gpgsign true", file=sys.stderr)
-    if not prompt_yes_no("Continue without signing?", default=True):
+    # Ask the user: proceed unsigned, skip, or enable signing globally.
+    choice = prompt_yes_no_sign(rel)
+
+    if choice == "no":
         info("Skipping commit for {}.".format(rel))
         return False
 
+    if choice == "configure":
+        info("Enabling commit.gpgsign globally...")
+        run_git(["config", "--global", "commit.gpgsign", "true"])
+        check_gpg_available(cwd=repo)
+        run_git(["commit", "-m", msg], cwd=repo)
+        return True
+
+    # choice == "yes" — proceed unsigned
     run_git(["commit", "-m", msg], cwd=repo)
     return True
 
@@ -1091,20 +1181,36 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
         skip_sign, reason = should_skip_signing(cwd=root)
         do_commit(tmpdir, "(new repo)", initial_commit_msg, skip_sign, reason)
 
-        # Create GitHub repo and push
+        # Create GitHub repo (no --source; we push manually to avoid gh
+        # using 'git -C' internally which requires git 1.8.5+)
         info("Creating GitHub repo '{}'...".format(qualified_name))
         visibility_flag = "--public" if is_public else "--private"
-        gh_args = ["repo", "create", qualified_name, visibility_flag,
-                   "--source", tmpdir, "--remote", "origin", "--push"]
+        gh_args = ["repo", "create", qualified_name, visibility_flag]
         if repo_desc:
             gh_args += ["--description", repo_desc]
         run_gh(gh_args)
 
+        # Fetch the SSH URL for the new repo.
+        # Try --json first (gh 2.x); fall back to parsing plain text output
+        # for older gh versions that don't support --json on repo view.
         new_repo_url = gh_output(
             ["repo", "view", qualified_name, "--json", "sshUrl", "--jq", ".sshUrl"])
         if not new_repo_url:
+            # Plain text fallback: parse the "Clone URL" line or build manually
+            plain = gh_output(["repo", "view", qualified_name])
+            for line in plain.splitlines():
+                # Look for a git@ SSH URL in the output
+                m = re.search(r"(git@github\.com:[^\s]+)", line)
+                if m:
+                    new_repo_url = m.group(1)
+                    break
+        if not new_repo_url:
             new_repo_url = "git@github.com:{}/{}.git".format(owner, repo_name)
         info("New repo URL: {}".format(new_repo_url))
+
+        # Wire up remote and push from the temp repo directly
+        run_git(["remote", "add", "origin", new_repo_url], cwd=tmpdir)
+        run_git(["push", "-u", "origin", "HEAD"], cwd=tmpdir)
 
     except Exception as e:
         die("Failed during new repo setup: {}".format(e))
@@ -1117,6 +1223,11 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     # -----------------------------------------------------------------------
     info("Removing '{}' from parent repo...".format(subdir_rel))
     run_git(["rm", "-r", subdir_rel], cwd=root)
+
+    # git rm removes tracked files but may leave the empty directory on disk.
+    # Remove it so git submodule add can create it cleanly.
+    if os.path.isdir(subdir_abs):
+        shutil.rmtree(subdir_abs)
 
     info("Adding '{}' as submodule...".format(subdir_rel))
     run_git(["submodule", "add", new_repo_url, subdir_rel], cwd=root)

@@ -11,10 +11,10 @@ Standard git does not understand that submodules need to be committed and pushed
 ## Requirements
 
 - Python 3.6 or later
-- git (any stock version)
+- git 1.7 or later (stock version shipped with any Linux distro since ~2012)
 - GPG configured if you want signed commits (see [Signing](#signing))
 - Linux, macOS, or Windows — see [Windows](#windows)
-- `gh` (GitHub CLI) — required only for `mgit detach` and `mgit attach`; see [GitHub CLI](#github-cli)
+- `gh` (GitHub CLI) — required only for `mgit detach`; see [GitHub CLI](#github-cli)
 
 ## Installation
 
@@ -215,7 +215,9 @@ After `mgit attach`, run `mgit push` to push both repos.
 
 ## GitHub CLI
 
-`mgit detach` requires the `gh` CLI to create and manage GitHub repositories. `mgit attach` does not need it. All other commands do not need it.
+`mgit detach` requires the `gh` CLI to create GitHub repositories. `mgit attach` does not need it. All other commands do not need it.
+
+`mgit` avoids using gh's `--source` flag (which makes gh call `git -C` internally and requires git 1.8.5+). Instead it creates the repo with `gh repo create` and pushes from the temp directory directly using git. This means any gh version that supports `gh repo create` works, and there is no minimum git version beyond what the rest of mgit requires.
 
 If `gh` is not installed, `mgit` will print platform-appropriate instructions and exit — it never installs anything automatically.
 
