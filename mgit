@@ -32,7 +32,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -664,8 +664,7 @@ def _gh_explain_403(stderr_text: str) -> None:
     """
     text = stderr_text.lower()
     if "403" in text or "forbidden" in text or "resource not accessible" in text \
-            or "token cannot" in text or "must have push access" in text \
-            or "not found" in text:
+            or "token cannot" in text or "must have push access" in text:
         print()
         error("GitHub API returned a permission error (HTTP 403 / 404).")
         print("[mgit]", file=sys.stderr)
@@ -714,20 +713,10 @@ def run_gh(args: List[str], check: bool = True,
     else:
         result = subprocess.run(cmd, env=env)
     if check and result.returncode != 0:
-        if capture:
-            sys.stderr.write(result.stderr)
-            _gh_explain_403(result.stderr)
-        else:
-            # Re-run capturing stderr so we can inspect it for 403
-            result2 = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                universal_newlines=True,
-                env=env
-            )
-            if result2.stderr:
-                sys.stderr.write(result2.stderr)
-            _gh_explain_403(result2.stderr)
+        stderr_text = result.stderr if capture else ""
+        if stderr_text:
+            sys.stderr.write(stderr_text)
+        _gh_explain_403(stderr_text)
         sys.exit(result.returncode)
     return result
 
@@ -920,14 +909,14 @@ def _parse_detach_args(root: str, extra_args: List[str]):
     Supported call forms
     --------------------
     Single directory — flat copy by default (contents at repo root):
-        mgit detach gui_frontend/src/jcom
+        mgit detach libs/mylib
 
     Single directory with trailing slash — also flat (accepted for clarity):
-        mgit detach gui_frontend/src/jcom/
+        mgit detach libs/mylib/
 
     Multiple paths (shell glob expansion) — flat copy, repo name default
     derived from the common parent directory:
-        mgit detach gui_frontend/src/jcom/*
+        mgit detach libs/mylib/*
 
     Explicit flags:
         --dest-subdir <name>   wrap contents in <name>/ inside the new repo
@@ -1002,12 +991,9 @@ def _parse_detach_args(root: str, extra_args: List[str]):
         if flag_dest_subdir is not None:
             # Explicit flag overrides everything
             dest_subdir = flag_dest_subdir
-        elif original_had_trailing_slash:
-            # Trailing slash is now redundant (default is already flat) but
-            # still accepted for clarity and backward compatibility.
-            dest_subdir = ""
         else:
             # Default: flat copy — contents go directly to the repo root.
+            # Trailing slash is accepted for clarity but has no effect.
             # Use --dest-subdir <name> to wrap in a named subfolder.
             dest_subdir = ""
 
@@ -1064,9 +1050,9 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     Supported forms:
       mgit detach <subdir>
           Flat copy — contents go directly to the new repo root.
-          (e.g. detaching jcom/ creates a repo whose root contains com/,
-          ecma335/, etc. — the submodule mounts at gui_frontend/src/jcom/
-          so all existing paths in the parent repo resolve correctly.)
+          (e.g. detaching src/jcom creates a repo whose root contains com/,
+          ecma335/ etc. — the submodule mounts at src/jcom/ in the parent
+          so all existing paths resolve correctly.)
 
       mgit detach <subdir>/
           Trailing slash — also flat, accepted for clarity.
@@ -1115,7 +1101,7 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     info("Detaching '{}' from '{}' into a new GitHub repo.".format(
         subdir_rel, parent_name))
     if dest_subdir:
-        info("Contents will be placed under '{}/'' in the new repo.".format(dest_subdir))
+        info("Contents will be placed under '{}/' in the new repo.".format(dest_subdir))
     else:
         info("Contents will be placed flat at the new repo root.")
 

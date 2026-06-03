@@ -137,27 +137,27 @@ The call form controls how content is laid out inside the new repo:
 
 ```bash
 # Default — flat copy, contents go directly to the new repo root
-mgit detach gui_frontend/src/jcom
+mgit detach libs/mylib
 
 # Trailing slash — also flat, accepted for clarity
-mgit detach gui_frontend/src/jcom/
+mgit detach libs/mylib/
 
 # Shell glob expansion — flat copy from the named items;
-# repo name default derived from the common parent (jcom)
-mgit detach gui_frontend/src/jcom/*
+# repo name default derived from the common parent (mylib)
+mgit detach libs/mylib/*
 
 # Explicit wrapper subdir name
-mgit detach gui_frontend/src/jcom --dest-subdir src
+mgit detach libs/mylib --dest-subdir mylib
 
 # Explicit flat — same as default, accepted for clarity
-mgit detach gui_frontend/src/jcom --no-dest-subdir
+mgit detach libs/mylib --no-dest-subdir
 ```
 
-**Default (flat):** contents go directly to the new repo root. Detaching `gui_frontend/src/jcom` creates a repo whose root contains `com/`, `ecma335/`, `winmd/` etc. The submodule mounts at `gui_frontend/src/jcom/` in the parent repo, so all existing paths resolve identically to before the detach.
+**Default (flat):** contents go directly to the new repo root. Detaching `libs/mylib` creates a repo whose root contains whatever was inside `mylib/`. The submodule mounts at `libs/mylib/` in the parent repo, so all existing paths resolve identically to before the detach.
 
-This is the right default for the common submodule use case: the directory name (`jcom`) is already represented by the submodule mount point, so no wrapper is needed inside the repo.
+This is the right default for the common submodule use case: the directory name (`mylib`) is already represented by the submodule mount point, so no wrapper is needed inside the repo.
 
-**Wrapped (`--dest-subdir <name>`):** contents are placed under `<name>/` inside the new repo root. Use this when the repo will primarily be cloned and used standalone — for example, if `jcom` is a Java package root and you want someone cloning the repo to see `jcom/com/`, `jcom/ecma335/` etc. at the top level. Note: when used as a submodule, this creates a `<name>/` subdirectory inside the mount point (`gui_frontend/src/jcom/jcom/`), which is usually not what you want for in-place submodule use.
+**Wrapped (`--dest-subdir <name>`):** contents are placed under `<name>/` inside the new repo root. Use this when the repo will primarily be cloned and used standalone — for example, if `mylib` is a package root and you want someone cloning the repo to see `mylib/` at the top level. Note: when used as a submodule, this creates a `<name>/` subdirectory inside the mount point (`libs/mylib/mylib/`), which is usually not what you want for in-place submodule use.
 
 The submodule mount point in the parent repo is always the detached directory path — only the internal repo layout differs.
 
@@ -412,15 +412,20 @@ git config --global commit.gpgsign true
 
 With `commit.gpgsign = true`, every `git commit` (and therefore every `mgit commit`) signs automatically. `mgit` performs a pre-flight check before committing: if signing is configured but GPG is misconfigured or the key is missing, it dies with a clear error before touching any repo.
 
-If `commit.gpgsign` is **not set**, `mgit` warns you before each unsigned commit and asks whether to continue:
+If `commit.gpgsign` is **not set**, `mgit` prompts with three options before each unsigned commit:
 
 ```
 [mgit] WARN: commit.gpgsign is not set for 'libs/crypto' — this commit will be unsigned.
-[mgit]       To enable signing: git config --global commit.gpgsign true
-Continue without signing? [Y/n]:
+[mgit]
+[mgit]   y  continue without signing (this commit only)
+[mgit]   n  skip this commit
+[mgit]   c  enable signing globally (git config --global commit.gpgsign true)
+[mgit]      and sign this commit
+[mgit]
+[mgit] Choice [Y/n/c]:
 ```
 
-The default is yes, so pressing Enter proceeds. This makes it easy to notice missing signing config without blocking automated use.
+`Y` (default) proceeds unsigned. `c` sets `commit.gpgsign = true` globally, verifies GPG is available, and signs the commit — subsequent repos in the same run are then signed automatically. `n` skips the commit for that repo.
 
 ### AI agent and bot exemptions
 
