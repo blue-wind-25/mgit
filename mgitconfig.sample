@@ -1,0 +1,26 @@
+# .mgitconfig - mgit configuration file
+#
+# Place this file in:
+#   - Your repo root (repo-specific config)
+#   - ~/.mgitconfig  (user-global config)
+#
+# Settings here EXTEND the built-in defaults; they do not replace them.
+# (no_sign_emails entries are appended to the built-in bot list)
+
+[signing]
+# Additional emails that should skip GPG signing.
+# One entry per line. Supports Python regex (full-string match).
+# The built-in list already covers Claude, Copilot, Codex, Gemini,
+# GitHub Actions, and any *[bot]@users.noreply.github.com pattern.
+#
+# no_sign_emails =
+#     myci-bot@mycompany.com
+#     deploy@mycompany.com
+
+[refs]
+# Commit message used when mgit push auto-commits updated submodule refs.
+# commit_msg = "chore: update submodule refs"
+
+[behavior]
+# Set to true to enable verbose logging of every git command invoked.
+# verbose = false

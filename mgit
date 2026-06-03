@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mgit - Multi-repo Git automation tool
+Recursively manages git repositories with submodules,
+handling commit ordering, signing enforcement, and ref updates.
+
+Requires: Python 3.6+, git (stock), bash (stock)
+Tested on: CentOS 7, Ubuntu 18+
+"""
+
+from __future__ import print_function
+
+import os
+import re
+import sys
+import fnmatch
+import argparse
+import configparser
+import subprocess
+from typing import List, Optional, Tuple, Dict
+
+# ---------------------------------------------------------------------------
+# Defaults (overridable via .mgitconfig)
+# ---------------------------------------------------------------------------
+
+VERSION = "1.0.0"
+
+DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
+
+# Exact or regex patterns for emails that should NOT be GPG-signed.
+# These are known AI agent / bot identities. Patterns are matched as
+# case-insensitive full-string regex against git config user.email.
+DEFAULT_NO_SIGN_EMAILS: List[str] = [
+    # Claude (Anthropic)
+    r"242468646\+claude@users\.noreply\.github\.com",
+    r"claude\[bot\]@users\.noreply\.github\.com",
+    r"noreply@anthropic\.com",
+    # GitHub Copilot
+    r"198982749\+copilot@users\.noreply\.github\.com",
+    # GitHub Actions built-in
+    r"41898282\+github-actions\[bot\]@users\.noreply\.github\.com",
+    # OpenAI Codex variants
+    r"codex@example\.com",                # bad default that ships with Codex CLI
+    r"noreply@codex\.openai\.com",        # proposed official
+    r"199175422\+chatgpt-codex-connector\[bot\]@users\.noreply\.github\.com",
+    # Google Gemini
+    r"218195315\+gemini-cli@users\.noreply\.github\.com",
+    r"gemini-code-assist\[bot\]@.*",
+    r"noreply@gemini\.google\.com",
+    # Generic catch-all: any GitHub-hosted [bot] account
+    r".*\[bot\]@users\.noreply\.github\.com",
+]
+
+# ---------------------------------------------------------------------------
+# Config loader
+# ---------------------------------------------------------------------------
+
+class MgitConfig:
+    """
+    Loads .mgitconfig from (in order):
+      1. cwd
+      2. ~/.mgitconfig
+      3. Built-in defaults
+    """
+
+    def __init__(self) -> None:
+        self.ref_commit_msg: str = DEFAULT_REF_COMMIT_MSG
+        self.no_sign_emails: List[str] = list(DEFAULT_NO_SIGN_EMAILS)
+        self.verbose: bool = False
+        self._load()
+
+    def _load(self) -> None:
+        candidates = [
+            os.path.join(os.getcwd(), ".mgitconfig"),
+            os.path.expanduser("~/.mgitconfig"),
+        ]
+        parser = configparser.ConfigParser()
+        for path in candidates:
+            if os.path.isfile(path):
+                parser.read(path)
+                break  # first found wins
+
+        if parser.has_option("refs", "commit_msg"):
+            self.ref_commit_msg = parser.get("refs", "commit_msg").strip('"\'')
+
+        if parser.has_option("signing", "no_sign_emails"):
+            raw = parser.get("signing", "no_sign_emails")
+            extras = [e.strip() for e in raw.splitlines() if e.strip()]
+            # Append to defaults, not replace
+            self.no_sign_emails.extend(extras)
+
+        if parser.has_option("behavior", "verbose"):
+            self.verbose = parser.getboolean("behavior", "verbose")
+
+
+CONFIG = MgitConfig()
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def info(msg: str) -> None:
+    print("[mgit] {}".format(msg), file=sys.stderr)
+
+def verbose(msg: str) -> None:
+    if CONFIG.verbose:
+        print("[mgit] {}".format(msg), file=sys.stderr)
+
+def warn(msg: str) -> None:
+    print("[mgit] WARN: {}".format(msg), file=sys.stderr)
+
+def error(msg: str) -> None:
+    print("[mgit] ERROR: {}".format(msg), file=sys.stderr)
+
+def die(msg: str, code: int = 1) -> None:
+    error(msg)
+    sys.exit(code)
+
+# ---------------------------------------------------------------------------
+# Git subprocess helpers
+# ---------------------------------------------------------------------------
+
+def run_git(args: List[str], cwd: str = None, check: bool = True,
+            capture: bool = False) -> subprocess.CompletedProcess:
+    """Run git with given args in cwd. Streams output unless capture=True."""
+    cmd = ["git"] + args
+    verbose("  $ {}  [in {}]".format(" ".join(cmd), cwd or os.getcwd()))
+    if capture:
+        result = subprocess.run(
+            cmd, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+    else:
+        result = subprocess.run(cmd, cwd=cwd)
+    if check and result.returncode != 0:
+        if capture:
+            sys.stderr.write(result.stderr)
+        sys.exit(result.returncode)
+    return result
+
+
+def git_output(args: List[str], cwd: str = None) -> str:
+    """Run git and return stdout, never raising on error (returns '')."""
+    result = run_git(args, cwd=cwd, check=False, capture=True)
+    return result.stdout.strip()
+
+
+def git_ok(args: List[str], cwd: str = None) -> bool:
+    """Return True if git command exits 0."""
+    result = subprocess.run(
+        ["git"] + args, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return result.returncode == 0
+
+# ---------------------------------------------------------------------------
+# Repository discovery
+# ---------------------------------------------------------------------------
+
+def is_git_repo(path: str) -> bool:
+    return git_ok(["rev-parse", "--git-dir"], cwd=path)
+
+
+def get_toplevel(path: str) -> Optional[str]:
+    """Return the git toplevel for path, or None if not in a repo."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=path,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return None
+
+
+def get_submodule_paths(repo_root: str) -> List[str]:
+    """
+    Return list of absolute paths for all direct submodules of repo_root,
+    as declared in .gitmodules. Returns [] if none.
+    """
+    gitmodules = os.path.join(repo_root, ".gitmodules")
+    if not os.path.isfile(gitmodules):
+        return []
+
+    result = subprocess.run(
+        ["git", "config", "--file", ".gitmodules",
+         "--get-regexp", r"submodule\..*\.path"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+    if result.returncode != 0:
+        return []
+
+    paths = []
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            rel = parts[1].strip()
+            abs_path = os.path.join(repo_root, rel)
+            if os.path.isdir(abs_path) and is_git_repo(abs_path):
+                paths.append(abs_path)
+    return paths
+
+
+def build_repo_tree(root: str) -> List[str]:
+    """
+    Recursively collect all repos (root + submodules) in bottom-up order
+    (leaves first, root last). This is the correct order for commit/push.
+    """
+    result = []
+    for sub in get_submodule_paths(root):
+        result.extend(build_repo_tree(sub))
+    result.append(root)
+    return result
+
+
+def build_repo_tree_topdown(root: str) -> List[str]:
+    """
+    Top-down order (root first). Used for pull/fetch/status.
+    """
+    result = [root]
+    for sub in get_submodule_paths(root):
+        result.extend(build_repo_tree_topdown(sub))
+    return result
+
+
+def find_invocation_root(start: str) -> str:
+    """
+    Walk up from start to find the highest git repo that contains start
+    as a submodule (directly or transitively). If start itself is not
+    a submodule of any parent, return start's own toplevel.
+
+    This ensures 'mgit' invoked from a subdir does NOT walk up into a
+    parent repo it doesn't own.
+    """
+    toplevel = get_toplevel(start)
+    if toplevel is None:
+        die("Not inside a git repository: {}".format(start))
+    return toplevel
+
+# ---------------------------------------------------------------------------
+# Signing helpers
+# ---------------------------------------------------------------------------
+
+def should_skip_signing(cwd: str = None) -> Tuple[bool, str]:
+    """
+    Check git config user.email in the given repo against the no-sign list.
+    Returns (skip: bool, reason: str).
+    """
+    email = git_output(["config", "user.email"], cwd=cwd).lower()
+    if not email:
+        return False, ""
+
+    for pattern in CONFIG.no_sign_emails:
+        try:
+            if re.fullmatch(pattern, email, re.IGNORECASE):
+                return True, "email '{}' matches no-sign pattern '{}'".format(
+                    email, pattern)
+        except re.error:
+            # Fall back to fnmatch for simple glob patterns
+            if fnmatch.fnmatch(email, pattern.lower()):
+                return True, "email '{}' matches no-sign glob '{}'".format(
+                    email, pattern)
+
+    return False, ""
+
+
+def verify_gpg_available(cwd: str = None) -> None:
+    """
+    Verify that GPG signing will actually work before attempting a commit.
+    Dies with a clear message if it won't.
+    """
+    # Check signing key is configured
+    key = git_output(["config", "--get", "user.signingkey"], cwd=cwd)
+    gpg_sign = git_output(["config", "--get", "commit.gpgsign"], cwd=cwd)
+
+    # If neither is configured, signing will fail — refuse early
+    if not key and gpg_sign.lower() not in ("true", "1", "yes"):
+        die(
+            "GPG signing is required but no signing key is configured.\n"
+            "       Set one with: git config --global user.signingkey <KEYID>\n"
+            "       Or configure commit.gpgsign=true with a default key.\n"
+            "       To skip signing for AI agents, ensure user.email matches\n"
+            "       a known bot pattern (see ~/.mgitconfig)."
+        )
+
+    # Also check gpg binary exists
+    gpg_prog = git_output(["config", "--get", "gpg.program"], cwd=cwd) or "gpg"
+    found = subprocess.run(
+        ["which", gpg_prog],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    if found.returncode != 0:
+        die("GPG signing required but '{}' binary not found in PATH.".format(
+            gpg_prog))
+
+# ---------------------------------------------------------------------------
+# has_staged_changes / has_unstaged_changes
+# ---------------------------------------------------------------------------
+
+def has_staged_changes(cwd: str) -> bool:
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return result.returncode != 0  # non-zero = there are staged changes
+
+
+def has_any_changes(cwd: str) -> bool:
+    """True if working tree or index has any modifications."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+    return bool(result.stdout.strip())
+
+
+def submodule_refs_dirty(parent: str) -> bool:
+    """
+    Return True if any submodule ref in parent's index differs from HEAD
+    (i.e. submodule was updated and parent needs a ref-update commit).
+    """
+    result = subprocess.run(
+        ["git", "submodule", "status"],
+        cwd=parent,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("+"):
+            return True
+    return False
+
+# ---------------------------------------------------------------------------
+# Command implementations
+# ---------------------------------------------------------------------------
+
+# --- status -----------------------------------------------------------------
+
+def cmd_status(root: str, extra_args: List[str]) -> None:
+    repos = build_repo_tree_topdown(root)
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        info("=== status: {} ===".format(rel))
+        run_git(["status"] + extra_args, cwd=repo, check=False)
+        print()
+
+
+# --- add --------------------------------------------------------------------
+
+def cmd_add(root: str, extra_args: List[str]) -> None:
+    """
+    In each repo (topdown), run git add with the given args.
+    For the primary repo, git add already tracks changed submodule refs,
+    so no special handling needed here — refs update happens at push time.
+    """
+    repos = build_repo_tree_topdown(root)
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        info("=== add: {} ===".format(rel))
+        run_git(["add"] + extra_args, cwd=repo, check=False)
+
+
+# --- commit -----------------------------------------------------------------
+
+def cmd_commit(root: str, extra_args: List[str]) -> None:
+    """
+    Commit all repos bottom-up (leaves first, root last).
+    - Signing enforced unless email matches no-sign list.
+    - Sub-repos committed first; root does NOT auto-update refs here
+      (refs update deferred to mgit push).
+    - Repos with nothing staged are skipped with a notice.
+    """
+    repos = build_repo_tree(root)  # bottom-up
+
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+
+        if not has_staged_changes(repo):
+            verbose("Nothing staged in {}, skipping commit.".format(rel))
+            continue
+
+        info("=== commit: {} ===".format(rel))
+
+        skip_sign, reason = should_skip_signing(cwd=repo)
+        if skip_sign:
+            info("Signing skipped for {}: {}".format(rel, reason))
+            commit_args = ["commit"] + extra_args
+        else:
+            verify_gpg_available(cwd=repo)
+            commit_args = ["commit", "-S"] + extra_args
+
+        run_git(commit_args, cwd=repo)
+
+
+# --- push -------------------------------------------------------------------
+
+def cmd_push(root: str, extra_args: List[str]) -> None:
+    """
+    Push sequence:
+      1. For each submodule (bottom-up): push to its own remote.
+      2. Back in root: if submodule refs have changed since last push,
+         stage them, make a signed ref-update commit, then push root.
+      3. If no ref changes, just push root normally.
+    """
+    repos = build_repo_tree(root)  # bottom-up
+    submodules = repos[:-1]        # everything except root
+    parent = repos[-1]             # root
+
+    # Step 1: push all submodules
+    for repo in submodules:
+        rel = os.path.relpath(repo, root)
+        info("=== push submodule: {} ===".format(rel))
+        run_git(["push"] + extra_args, cwd=repo)
+
+    # Step 2: update submodule refs in root if needed
+    if submodules and submodule_refs_dirty(parent):
+        info("Staging updated submodule refs in root repo...")
+        run_git(["add"] + [os.path.relpath(s, parent) for s in submodules],
+                cwd=parent)
+
+        skip_sign, reason = should_skip_signing(cwd=parent)
+        if skip_sign:
+            info("Ref-update commit signing skipped: {}".format(reason))
+            run_git(["commit", "-m", CONFIG.ref_commit_msg], cwd=parent)
+        else:
+            verify_gpg_available(cwd=parent)
+            run_git(["commit", "-S", "-m", CONFIG.ref_commit_msg], cwd=parent)
+
+    # Step 3: push root
+    info("=== push root: {} ===".format(os.path.basename(parent)))
+    run_git(["push"] + extra_args, cwd=parent)
+
+
+# --- pull -------------------------------------------------------------------
+
+def cmd_pull(root: str, extra_args: List[str]) -> None:
+    """
+    Pull root first, then update submodules recursively.
+    After pull, sync submodule URLs and update to recorded SHAs.
+    """
+    info("=== pull root: {} ===".format(os.path.basename(root)))
+    run_git(["pull"] + extra_args, cwd=root)
+
+    subs = get_submodule_paths(root)
+    if subs:
+        info("Updating submodules...")
+        run_git(["submodule", "sync", "--recursive"], cwd=root)
+        run_git(["submodule", "update", "--init", "--recursive"], cwd=root)
+
+
+# --- fetch ------------------------------------------------------------------
+
+def cmd_fetch(root: str, extra_args: List[str]) -> None:
+    repos = build_repo_tree_topdown(root)
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        info("=== fetch: {} ===".format(rel))
+        run_git(["fetch"] + extra_args, cwd=repo, check=False)
+
+
+# --- diff -------------------------------------------------------------------
+
+def cmd_diff(root: str, extra_args: List[str]) -> None:
+    repos = build_repo_tree_topdown(root)
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        info("=== diff: {} ===".format(rel))
+        run_git(["diff"] + extra_args, cwd=repo, check=False)
+        print()
+
+
+# --- log --------------------------------------------------------------------
+
+def cmd_log(root: str, extra_args: List[str]) -> None:
+    repos = build_repo_tree_topdown(root)
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        info("=== log: {} ===".format(rel))
+        run_git(["log"] + extra_args, cwd=repo, check=False)
+        print()
+
+
+# --- passthrough ------------------------------------------------------------
+
+def cmd_passthrough(command: str, root: str, extra_args: List[str]) -> None:
+    """
+    For any git command not explicitly handled, run it in every repo
+    top-down, passing all args unchanged.
+    """
+    repos = build_repo_tree_topdown(root)
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        info("=== {}: {} ===".format(command, rel))
+        run_git([command] + extra_args, cwd=repo, check=False)
+        print()
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+# Commands that need bottom-up ordering (leaves before root)
+BOTTOMUP_COMMANDS = {"commit", "push"}
+
+# Commands with dedicated implementations
+KNOWN_COMMANDS = {
+    "status":  cmd_status,
+    "add":     cmd_add,
+    "commit":  cmd_commit,
+    "push":    cmd_push,
+    "pull":    cmd_pull,
+    "fetch":   cmd_fetch,
+    "diff":    cmd_diff,
+    "log":     cmd_log,
+}
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        # No subcommand: show help
+        print("mgit v{} - multi-repo git wrapper".format(VERSION))
+        print("Usage: mgit <git-command> [args...]")
+        print()
+        print("Supported multi-repo commands:")
+        print("  status, add, commit, push, pull, fetch, diff, log")
+        print()
+        print("Any other git command is passed through to all repos.")
+        print("Run from any directory inside a git repo.")
+        sys.exit(0)
+
+    # Handle --version
+    if sys.argv[1] in ("--version", "-V"):
+        print("mgit {}".format(VERSION))
+        sys.exit(0)
+
+    # Handle --verbose flag before the git subcommand
+    args = sys.argv[1:]
+    if "--verbose" in args:
+        CONFIG.verbose = True
+        args = [a for a in args if a != "--verbose"]
+
+    command = args[0]
+    extra_args = args[1:]
+
+    # Resolve the invocation root
+    cwd = os.path.abspath(os.getcwd())
+    root = find_invocation_root(cwd)
+
+    verbose("Invocation root: {}".format(root))
+    verbose("Command: {}  Extra args: {}".format(command, extra_args))
+
+    # Dispatch
+    if command in KNOWN_COMMANDS:
+        KNOWN_COMMANDS[command](root, extra_args)
+    else:
+        cmd_passthrough(command, root, extra_args)
+
+
+if __name__ == "__main__":
+    main()
