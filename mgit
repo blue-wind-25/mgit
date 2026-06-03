@@ -32,7 +32,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -1545,6 +1545,61 @@ def cmd_log(root: str, extra_args: List[str]) -> None:
         print()
 
 
+def cmd_sync(root: str, extra_args: List[str]) -> None:
+    """
+    Stage tracked changes, commit, and push across all repos in the correct
+    order. Safe alternative to running add/commit/push manually when you have
+    used plain git for some operations and want to restore a consistent state.
+
+    Sequence:
+      1. git add -u (tracked changes only) in all repos, bottom-up.
+         Untracked files and build artefacts are never touched.
+      2. Commit all repos that have staged changes, bottom-up.
+         Default message: "chore: sync"  (override with -m "msg").
+      3. Push all repos bottom-up; auto-stage and commit stale submodule
+         ref pointers in the parent if needed.
+
+    Usage:
+      mgit sync
+      mgit sync -m "feat: my message"
+    """
+    # Extract -m / --message if provided; rest is ignored for sync
+    has_msg = _has_message_flag(extra_args)
+    commit_msg = _extract_message(extra_args) if has_msg else "chore: sync"
+
+    repos = build_repo_tree(root)  # bottom-up
+
+    # -----------------------------------------------------------------------
+    # Step 1 — stage tracked changes in all repos
+    # -----------------------------------------------------------------------
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        info("=== sync add -u: {} ===".format(rel))
+        run_git(["add", "-u"], cwd=repo, check=False)
+
+    # -----------------------------------------------------------------------
+    # Step 2 — commit repos that have staged changes
+    # -----------------------------------------------------------------------
+    any_committed = False
+    for repo in repos:
+        rel = os.path.relpath(repo, root) if repo != root else "."
+        if not has_staged_changes(repo):
+            verbose("Nothing staged in {}, skipping commit.".format(rel))
+            continue
+        info("=== sync commit: {} ===".format(rel))
+        skip_sign, reason = should_skip_signing(cwd=repo)
+        if do_commit(repo, rel, commit_msg, skip_sign, reason):
+            any_committed = True
+
+    if not any_committed:
+        info("Nothing to commit — pushing any unpushed commits.")
+
+    # -----------------------------------------------------------------------
+    # Step 3 — push bottom-up (reuses cmd_push logic directly)
+    # -----------------------------------------------------------------------
+    cmd_push(root, [])
+
+
 def cmd_passthrough(command: str, root: str, extra_args: List[str]) -> None:
     """Pass any unrecognised git command through to all repos top-down."""
     for repo in build_repo_tree_topdown(root):
@@ -1566,6 +1621,7 @@ KNOWN_COMMANDS = {
     "fetch":   cmd_fetch,
     "diff":    cmd_diff,
     "log":     cmd_log,
+    "sync":    cmd_sync,
     "detach":  cmd_detach,
     "attach":  cmd_attach,
 }
@@ -1578,6 +1634,13 @@ def main() -> None:
         print()
         print("Supported multi-repo commands:")
         print("  status, add, commit [-m \"msg\"], push, pull, fetch, diff, log")
+        print()
+        print("Recovery / catch-up:")
+        print("  sync [-m \"msg\"]  — stage tracked changes (git add -u), commit, and push")
+        print("                     all repos in correct order. Safe: never touches")
+        print("                     untracked files or build artefacts. Default commit")
+        print("                     message: 'chore: sync'. Also useful after using plain")
+        print("                     git directly to restore consistent pushed state.")
         print()
         print("Submodule management (requires gh CLI):")
         print("  detach <subdir>                       — detach flat (contents at new repo root, default)")

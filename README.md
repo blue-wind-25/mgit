@@ -63,6 +63,7 @@ mgit <command> [args...]
 | `mgit fetch` | Fetch all repos |
 | `mgit diff` | Diff all repos |
 | `mgit log` | Log all repos |
+| `mgit sync [-m "msg"]` | Stage tracked changes, commit, and push all repos safely |
 | `mgit detach <subdir>` | Extract a subdirectory into a new GitHub repo and re-add it as a submodule |
 | `mgit attach <subdir> <submodule-path>` | Move a subdirectory's contents into an existing submodule |
 | `mgit <anything>` | Any other git command is passed through to all repos |
@@ -81,6 +82,30 @@ mgit push
 `mgit commit` commits submodules first (bottom-up), then the root. Submodule ref pointers in the root are **not** updated until `mgit push`, keeping `commit` a local-only operation.
 
 `mgit push` then: pushes each submodule to its own remote, stages the updated ref pointers in the root, makes an automatic commit (`chore: update submodule refs`), and pushes the root.
+
+### Recovery and catch-up with `mgit sync`
+
+If you used plain `git` directly for some operations (or an AI coding agent committed inside a submodule without going through mgit), run:
+
+```bash
+mgit sync
+```
+
+Or with a custom message:
+
+```bash
+mgit sync -m "feat: implement BLE notifications"
+```
+
+`mgit sync` does three things in the correct bottom-up order:
+
+1. **`git add -u`** in every repo — stages modifications and deletions to already-tracked files only. Untracked files and build artefacts are never touched, so there is no risk of accidentally committing generated output.
+2. **Commit** every repo that has staged changes, using the provided message or `chore: sync` as the default.
+3. **Push** all repos — submodules first, then auto-stages any stale submodule ref pointers in the parent, commits the ref update, and pushes the root.
+
+If there is nothing to commit (everything is already committed), `mgit sync` skips straight to the push step — making it safe to run as a general "make sure everything is pushed" command.
+
+`mgit push` on its own is the right tool when you have already committed everything correctly and just need to push in the right order.
 
 ### Per-repo commit messages
 
