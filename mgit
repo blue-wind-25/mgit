@@ -919,27 +919,26 @@ def _parse_detach_args(root: str, extra_args: List[str]):
 
     Supported call forms
     --------------------
-    Single directory — dest_subdir defaults to the last path segment:
+    Single directory — flat copy by default (contents at repo root):
         mgit detach gui_frontend/src/jcom
 
-    Single directory with trailing slash — flat copy, no wrapper:
+    Single directory with trailing slash — also flat (accepted for clarity):
         mgit detach gui_frontend/src/jcom/
 
     Multiple paths (shell glob expansion) — flat copy, repo name default
     derived from the common parent directory:
         mgit detach gui_frontend/src/jcom/*
 
-    Explicit flags (override the above defaults):
+    Explicit flags:
         --dest-subdir <name>   wrap contents in <name>/ inside the new repo
         --dest-subdir=<name>   same, alternate syntax
-        --no-dest-subdir       flat copy regardless of trailing slash
+        --no-dest-subdir       flat copy (same as default; accepted for clarity)
     """
     USAGE = (
         "Usage: mgit detach <subdir>\n"
-        "       mgit detach <subdir>/          (flat — no wrapper subdir)\n"
         "       mgit detach <subdir>/*         (flat — shell glob, same effect)\n"
-        "       mgit detach <subdir> --dest-subdir <name>\n"
-        "       mgit detach <subdir> --no-dest-subdir"
+        "       mgit detach <subdir> --dest-subdir <name>  (wrap in named subdir)\n"
+        "       mgit detach <subdir> --no-dest-subdir      (flat, explicit)"
     )
 
     if not extra_args:
@@ -1004,11 +1003,13 @@ def _parse_detach_args(root: str, extra_args: List[str]):
             # Explicit flag overrides everything
             dest_subdir = flag_dest_subdir
         elif original_had_trailing_slash:
-            # Trailing slash → user explicitly asked for flat
+            # Trailing slash is now redundant (default is already flat) but
+            # still accepted for clarity and backward compatibility.
             dest_subdir = ""
         else:
-            # Default: wrap in a subdir named after the directory
-            dest_subdir = os.path.basename(subdir_abs)
+            # Default: flat copy — contents go directly to the repo root.
+            # Use --dest-subdir <name> to wrap in a named subfolder.
+            dest_subdir = ""
 
     else:
         # -----------------------------------------------------------------------
@@ -1062,21 +1063,27 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
 
     Supported forms:
       mgit detach <subdir>
-          Contents are wrapped in a <subdir-name>/ folder inside the new repo
-          (e.g. detaching jcom/ creates a repo whose root contains jcom/).
+          Flat copy — contents go directly to the new repo root.
+          (e.g. detaching jcom/ creates a repo whose root contains com/,
+          ecma335/, etc. — the submodule mounts at gui_frontend/src/jcom/
+          so all existing paths in the parent repo resolve correctly.)
 
       mgit detach <subdir>/
-          Trailing slash — flat copy, contents go directly to the repo root.
+          Trailing slash — also flat, accepted for clarity.
 
       mgit detach <subdir>/*
           Shell glob expansion — flat copy from the named items; repo name
           default is derived from the common parent directory.
 
       mgit detach <subdir> --dest-subdir <name>
-          Wrap contents in <name>/ regardless of trailing slash.
+          Wrap contents in <name>/ inside the new repo root. Use this when
+          the repo will primarily be used standalone (e.g. the directory
+          name is a Java/Python package root and you want it preserved
+          inside the repo). Note: creates <subdir>/<name>/ in the parent
+          repo when used as a submodule.
 
       mgit detach <subdir> --no-dest-subdir
-          Flat copy regardless of trailing slash.
+          Flat copy, same as default. Accepted for clarity.
 
     The new repo can be created under the authenticated user's personal
     account or any GitHub organisation they belong to. mgit prompts for
@@ -1573,11 +1580,10 @@ def main() -> None:
         print("  status, add, commit [-m \"msg\"], push, pull, fetch, diff, log")
         print()
         print("Submodule management (requires gh CLI):")
-        print("  detach <subdir>                  — detach subdir; contents wrapped in <subdir>/ in new repo")
-        print("  detach <subdir>/                 — detach flat (trailing slash = no wrapper subdir)")
-        print("  detach <subdir>/*                — detach flat from shell-expanded contents")
-        print("  detach <subdir> --dest-subdir <name>  — wrap contents in <name>/ explicitly")
-        print("  detach <subdir> --no-dest-subdir      — flat copy explicitly")
+        print("  detach <subdir>                       — detach flat (contents at new repo root, default)")
+        print("  detach <subdir>/*                     — detach flat from shell-expanded contents")
+        print("  detach <subdir> --dest-subdir <name>  — wrap contents in <name>/ inside new repo")
+        print("  detach <subdir> --no-dest-subdir      — flat copy (same as default, explicit)")
         print("  attach <subdir> <submodule-path> — move subdir contents into an existing submodule")
         print()
         print("Any other git command is passed through to all repos.")

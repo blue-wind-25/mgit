@@ -111,10 +111,10 @@ Extracts a subdirectory from the current repo, creates a new GitHub repository f
 The call form controls how content is laid out inside the new repo:
 
 ```bash
-# Default — contents wrapped in a jcom/ subdir at the new repo root
+# Default — flat copy, contents go directly to the new repo root
 mgit detach gui_frontend/src/jcom
 
-# Trailing slash — flat copy, contents go directly to the new repo root
+# Trailing slash — also flat, accepted for clarity
 mgit detach gui_frontend/src/jcom/
 
 # Shell glob expansion — flat copy from the named items;
@@ -124,15 +124,17 @@ mgit detach gui_frontend/src/jcom/*
 # Explicit wrapper subdir name
 mgit detach gui_frontend/src/jcom --dest-subdir src
 
-# Explicit flat, overrides default wrapping
+# Explicit flat — same as default, accepted for clarity
 mgit detach gui_frontend/src/jcom --no-dest-subdir
 ```
 
-**Default (no trailing slash):** the last path segment becomes the wrapper subdir. Detaching `gui_frontend/src/jcom` creates a new repo whose root contains `jcom/com`, `jcom/ecma335`, etc. This preserves your package root structure inside the repo and is the right default for Java/Kotlin packages, Python packages, or any project where the directory name is the package name.
+**Default (flat):** contents go directly to the new repo root. Detaching `gui_frontend/src/jcom` creates a repo whose root contains `com/`, `ecma335/`, `winmd/` etc. The submodule mounts at `gui_frontend/src/jcom/` in the parent repo, so all existing paths resolve identically to before the detach.
 
-**Flat (trailing slash or `/*`):** contents go directly to the repo root. `jcom/com`, `jcom/ecma335` become `com/`, `ecma335/` at the root.
+This is the right default for the common submodule use case: the directory name (`jcom`) is already represented by the submodule mount point, so no wrapper is needed inside the repo.
 
-The submodule mount point in the parent repo (`gui_frontend/src/jcom`) is always the same regardless of layout — only the internal structure of the new repo differs.
+**Wrapped (`--dest-subdir <name>`):** contents are placed under `<name>/` inside the new repo root. Use this when the repo will primarily be cloned and used standalone — for example, if `jcom` is a Java package root and you want someone cloning the repo to see `jcom/com/`, `jcom/ecma335/` etc. at the top level. Note: when used as a submodule, this creates a `<name>/` subdirectory inside the mount point (`gui_frontend/src/jcom/jcom/`), which is usually not what you want for in-place submodule use.
+
+The submodule mount point in the parent repo is always the detached directory path — only the internal repo layout differs.
 
 #### Interactive prompts
 
