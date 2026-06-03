@@ -14,6 +14,7 @@ Standard git does not understand that submodules need to be committed and pushed
 - git (any stock version)
 - GPG configured for signing (required for human committers; see [Signing](#signing))
 - Linux or macOS — tested on CentOS 7 and Ubuntu 18+
+- `gh` (GitHub CLI) — required only for `mgit detach` and `mgit attach`; see [GitHub CLI](#github-cli)
 
 ## Installation
 
@@ -51,6 +52,8 @@ mgit <command> [args...]
 | `mgit fetch` | Fetch all repos |
 | `mgit diff` | Diff all repos |
 | `mgit log` | Log all repos |
+| `mgit detach <subdir>` | Extract a subdirectory into a new GitHub repo and re-add it as a submodule |
+| `mgit attach <subdir> <submodule-path>` | Move a subdirectory's contents into an existing submodule |
 | `mgit <anything>` | Any other git command is passed through to all repos |
 
 All extra flags and arguments are forwarded to git unchanged.
@@ -71,6 +74,58 @@ mgit push
 ### Working from a subdirectory
 
 `mgit` detects the root of the current repo and operates from there. Running `mgit` from inside a submodule only operates on that submodule and its own nested submodules — it does not walk up to parent repos.
+
+## Submodule management
+
+### `mgit detach <subdir>`
+
+Extracts a subdirectory from the current repo, creates a new GitHub repository for it, and re-adds it as a submodule. The subdirectory's git history is not carried over — the new repo starts with a single clean initial commit.
+
+```bash
+mgit detach libs/crypto
+```
+
+`mgit` will interactively ask for:
+
+- **New repo name** — defaults to the subdirectory basename
+- **Description** — optional, passed to `gh repo create`
+- **Visibility** — public or private
+- **Initial commit message** — whether to include the parent repo name (a privacy warning is shown if the parent is private and the new repo is public)
+
+The sequence performed:
+
+1. Validates the subdir exists, is not already a submodule, and the working tree is clean
+2. Creates a temporary git repo, copies the subdir contents in, and commits with the same signing logic as the parent
+3. Creates the GitHub repo via `gh` and pushes
+4. Removes the subdir from the parent with `git rm -r`
+5. Adds the new repo back as a submodule
+6. Commits the change in the parent
+
+After `mgit detach`, run `mgit push` to push both repos to their remotes.
+
+#### Nested detach
+
+If a submodule itself contains subdirectories that need further splitting, `mgit detach` can be run from inside the submodule. The parent will pick up the updated `.gitmodules` ref on the next `mgit push`.
+
+### `mgit attach <subdir> <submodule-path>`
+
+Moves the contents of a subdirectory into an existing submodule, then removes the subdirectory from the parent. This is the complement of `detach` — useful when you want to consolidate a directory into a repo that already exists as a submodule rather than creating a new one.
+
+```bash
+mgit attach libs/utils vendor/common
+```
+
+`mgit` will ask for the destination path inside the target submodule (defaults to the subdirectory's basename), and warn if that destination already exists.
+
+The sequence performed:
+
+1. Validates the subdir exists, the target is an existing submodule, and both repos have clean working trees
+2. Copies the subdir contents into the specified path inside the submodule
+3. Commits the addition inside the submodule (with signing logic)
+4. Removes the subdir from the parent and stages the updated submodule ref
+5. Commits the change in the parent
+
+After `mgit attach`, run `mgit push` to push both repos.
 
 ## Signing
 
@@ -99,6 +154,33 @@ git config --global commit.gpgsign true
 When signing is skipped, a log line is printed showing the matched email and pattern.
 
 To add your own CI or deploy bot emails, see [Configuration](#configuration).
+
+## GitHub CLI
+
+`mgit detach` and `mgit attach` require the `gh` CLI to create and manage GitHub repositories. The other commands (`status`, `commit`, `push`, etc.) do not need it.
+
+If `gh` is not installed, `mgit` will print platform-appropriate installation instructions and exit — it will never install anything automatically.
+
+Install `gh`:
+
+```bash
+# macOS
+brew install gh
+
+# Debian / Ubuntu
+sudo apt install gh
+
+# Fedora / CentOS
+sudo dnf install gh
+
+# Or download from https://github.com/cli/cli/releases/latest
+```
+
+After installing, authenticate once:
+
+```bash
+gh auth login
+```
 
 ## Configuration
 
@@ -146,6 +228,8 @@ The `--verbose` flag can also be set permanently via `~/.mgitconfig`.
 ## Public submodules inside a private repo
 
 A primary use case for `mgit` is a private root repository that contains one or more public submodules. Because the root only stores SHA pointers, none of the submodule code or history is exposed through the private repo. Each submodule pushes to its own independent remote — public or private — and `mgit` keeps the ordering correct automatically.
+
+`mgit detach` is purpose-built for this workflow. When detaching a subdirectory into a public repo, `mgit` warns before including the private parent repo name in the initial commit message, and defaults to omitting it.
 
 ## How commit ordering works
 

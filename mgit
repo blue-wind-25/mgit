@@ -14,6 +14,8 @@ from __future__ import print_function
 import os
 import re
 import sys
+import shutil
+import tempfile
 import fnmatch
 import argparse
 import configparser
@@ -24,7 +26,7 @@ from typing import List, Optional, Tuple, Dict
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -116,6 +118,31 @@ def error(msg: str) -> None:
 def die(msg: str, code: int = 1) -> None:
     error(msg)
     sys.exit(code)
+
+def prompt(msg: str, default: str = "") -> str:
+    """Prompt the user for input, with an optional default value."""
+    if default:
+        display = "{} [{}]: ".format(msg, default)
+    else:
+        display = "{}: ".format(msg)
+    try:
+        answer = input(display).strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        die("Aborted.")
+    return answer if answer else default
+
+def prompt_yes_no(msg: str, default: bool = True) -> bool:
+    """Prompt for a yes/no answer. Returns True for yes, False for no."""
+    hint = "Y/n" if default else "y/N"
+    try:
+        answer = input("{} [{}]: ".format(msg, hint)).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        die("Aborted.")
+    if not answer:
+        return default
+    return answer in ("y", "yes")
 
 # ---------------------------------------------------------------------------
 # Git subprocess helpers
@@ -337,6 +364,475 @@ def submodule_refs_dirty(parent: str) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
+# gh helpers
+# ---------------------------------------------------------------------------
+
+def find_gh() -> Optional[str]:
+    """Return the path to the gh binary, or None if not found."""
+    result = subprocess.run(
+        ["which", "gh"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return None
+
+
+def offer_gh_install() -> None:
+    """
+    Print platform-appropriate install instructions for gh and exit.
+    Never installs automatically — user's choice.
+    """
+    import platform
+    system = platform.system().lower()
+
+    print()
+    print("  'gh' (GitHub CLI) is required for this command but was not found in PATH.")
+    print()
+    if system == "darwin":
+        print("  Install with Homebrew:")
+        print("      brew install gh")
+    elif system == "linux":
+        print("  Install on Debian/Ubuntu:")
+        print("      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\")
+        print("        | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg")
+        print("      echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \\")
+        print("        https://cli.github.com/packages stable main\" \\")
+        print("        | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null")
+        print("      sudo apt update && sudo apt install gh")
+        print()
+        print("  Install on CentOS/RHEL/Fedora:")
+        print("      sudo dnf install 'dnf-command(config-manager)'")
+        print("      sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo")
+        print("      sudo dnf install gh")
+    elif system == "windows":
+        print("  Install with winget:")
+        print("      winget install --id GitHub.cli")
+        print()
+        print("  Or with Scoop:")
+        print("      scoop install gh")
+    else:
+        print("  Download from: https://github.com/cli/cli/releases/latest")
+
+    print()
+    print("  After installing, authenticate with: gh auth login")
+    print("  Then re-run your mgit command.")
+    print()
+    sys.exit(1)
+
+
+def require_gh() -> str:
+    """Return gh path or offer install instructions and exit."""
+    gh = find_gh()
+    if not gh:
+        offer_gh_install()
+    return gh
+
+
+def run_gh(args: List[str], check: bool = True,
+           capture: bool = False) -> subprocess.CompletedProcess:
+    """Run gh with given args."""
+    cmd = ["gh"] + args
+    verbose("  $ {}".format(" ".join(cmd)))
+    if capture:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+    else:
+        result = subprocess.run(cmd)
+    if check and result.returncode != 0:
+        if capture:
+            sys.stderr.write(result.stderr)
+        sys.exit(result.returncode)
+    return result
+
+
+def gh_output(args: List[str]) -> str:
+    """Run gh and return stdout."""
+    result = run_gh(args, check=False, capture=True)
+    return result.stdout.strip()
+
+# ---------------------------------------------------------------------------
+# Remote / repo name helpers
+# ---------------------------------------------------------------------------
+
+def get_origin_url(cwd: str = None) -> str:
+    """Return the origin remote URL, or '' if none."""
+    return git_output(["remote", "get-url", "origin"], cwd=cwd)
+
+
+def repo_name_from_url(url: str) -> str:
+    """
+    Extract the bare repo name from a remote URL.
+    Works for both https://github.com/owner/name.git and git@github.com:owner/name.git
+    Returns '' if parsing fails.
+    """
+    if not url:
+        return ""
+    # Strip trailing .git
+    url = re.sub(r"\.git$", "", url)
+    # Last path component
+    parts = re.split(r"[/:]", url)
+    parts = [p for p in parts if p]
+    return parts[-1] if parts else ""
+
+
+def gh_repo_owner() -> str:
+    """Return the authenticated GitHub username via gh, or ''."""
+    return gh_output(["api", "user", "--jq", ".login"])
+
+# ---------------------------------------------------------------------------
+# detach — split a subdir into its own new GitHub repo and re-add as submodule
+# ---------------------------------------------------------------------------
+
+def cmd_detach(root: str, extra_args: List[str]) -> None:
+    """
+    Detach a subdirectory from the current repo, create a new GitHub repo
+    for it, and re-add it as a submodule.
+
+    Usage: mgit detach <subdir>
+    """
+    # -----------------------------------------------------------------------
+    # 0. Parse args
+    # -----------------------------------------------------------------------
+    if not extra_args:
+        die("Usage: mgit detach <subdir>\n"
+            "       Detaches a subdirectory into its own repo and adds it as a submodule.")
+
+    subdir_arg = extra_args[0].rstrip("/")
+
+    # Resolve subdir relative to repo root
+    subdir_abs = os.path.normpath(os.path.join(root, subdir_arg))
+    subdir_rel = os.path.relpath(subdir_abs, root)  # canonical relative path
+
+    # -----------------------------------------------------------------------
+    # 1. Validate
+    # -----------------------------------------------------------------------
+    if not os.path.isdir(subdir_abs):
+        die("Subdir not found: {}".format(subdir_abs))
+
+    if not subdir_abs.startswith(root + os.sep):
+        die("Subdir must be inside the repo root: {}".format(root))
+
+    # Must not already be a submodule
+    existing_subs = get_submodule_paths(root)
+    if subdir_abs in existing_subs:
+        die("'{}' is already a submodule.".format(subdir_rel))
+
+    # Must not have uncommitted changes in the repo
+    if has_any_changes(root):
+        die("The repo has uncommitted changes. Please commit or stash them first.")
+
+    # -----------------------------------------------------------------------
+    # 2. Require gh
+    # -----------------------------------------------------------------------
+    require_gh()
+
+    # -----------------------------------------------------------------------
+    # 3. Gather info from user
+    # -----------------------------------------------------------------------
+    origin_url  = get_origin_url(root)
+    parent_name = repo_name_from_url(origin_url) or os.path.basename(root)
+
+    print()
+    info("Detaching '{}' from '{}' into a new GitHub repo.".format(
+        subdir_rel, parent_name))
+    print()
+
+    default_repo_name = os.path.basename(subdir_rel)
+    repo_name    = prompt("New repo name", default=default_repo_name)
+    repo_desc    = prompt("Description (optional)", default="")
+    is_public    = prompt_yes_no("Make the new repo public?", default=True)
+
+    # Warn about commit message leaking private repo name
+    include_origin = False
+    if is_public and origin_url:
+        print()
+        warn("The parent repo name '{}' will appear in the initial commit message.".format(
+            parent_name))
+        include_origin = prompt_yes_no(
+            "Include parent repo name in initial commit message?", default=False)
+
+    if include_origin:
+        initial_commit_msg = "chore: initial commit — split from {}/{}".format(
+            parent_name, subdir_rel)
+    else:
+        initial_commit_msg = "chore: initial commit — split from {}".format(subdir_rel)
+
+    print()
+    info("Summary:")
+    info("  Subdir       : {}".format(subdir_rel))
+    info("  New repo     : {}".format(repo_name))
+    info("  Visibility   : {}".format("public" if is_public else "private"))
+    info("  Initial msg  : {}".format(initial_commit_msg))
+    print()
+
+    if not prompt_yes_no("Proceed?", default=True):
+        die("Aborted.", code=0)
+
+    # -----------------------------------------------------------------------
+    # 4. Create new git repo in a temp dir and populate it
+    # -----------------------------------------------------------------------
+    tmpdir = tempfile.mkdtemp(prefix="mgit-detach-")
+    info("Working in temp dir: {}".format(tmpdir))
+
+    try:
+        # Init
+        run_git(["init"], cwd=tmpdir)
+
+        # Copy contents of subdir into temp repo root
+        # Use rsync-style copy: contents of subdir_abs go into tmpdir
+        for item in os.listdir(subdir_abs):
+            src = os.path.join(subdir_abs, item)
+            dst = os.path.join(tmpdir, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+
+        # Stage everything
+        run_git(["add", "-A"], cwd=tmpdir)
+
+        # Carry over git identity from parent repo
+        user_name  = git_output(["config", "user.name"],  cwd=root)
+        user_email = git_output(["config", "user.email"], cwd=root)
+        if user_name:
+            run_git(["config", "user.name",  user_name],  cwd=tmpdir)
+        if user_email:
+            run_git(["config", "user.email", user_email], cwd=tmpdir)
+
+        # Commit — apply same signing logic as parent
+        skip_sign, reason = should_skip_signing(cwd=root)
+        if skip_sign:
+            info("Signing skipped for new repo: {}".format(reason))
+            run_git(["commit", "-m", initial_commit_msg], cwd=tmpdir)
+        else:
+            verify_gpg_available(cwd=root)
+            run_git(["commit", "-S", "-m", initial_commit_msg], cwd=tmpdir)
+
+        # -----------------------------------------------------------------------
+        # 5. Create GitHub repo and push
+        # -----------------------------------------------------------------------
+        info("Creating GitHub repo '{}'...".format(repo_name))
+        visibility_flag = "--public" if is_public else "--private"
+        gh_args = ["repo", "create", repo_name, visibility_flag, "--source", tmpdir,
+                   "--remote", "origin", "--push"]
+        if repo_desc:
+            gh_args += ["--description", repo_desc]
+        run_gh(gh_args)
+
+        # Retrieve the new repo's URL
+        new_repo_url = gh_output(["repo", "view", repo_name, "--json", "sshUrl", "--jq", ".sshUrl"])
+        if not new_repo_url:
+            # Fallback: construct from owner + name
+            owner = gh_repo_owner()
+            new_repo_url = "git@github.com:{}/{}.git".format(owner, repo_name)
+        info("New repo URL: {}".format(new_repo_url))
+
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        die("Failed during new repo setup: {}".format(e))
+
+    finally:
+        # Always clean up temp dir
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # -----------------------------------------------------------------------
+    # 6. Remove subdir from parent and add as submodule
+    # -----------------------------------------------------------------------
+    info("Removing '{}' from parent repo...".format(subdir_rel))
+    run_git(["rm", "-r", subdir_rel], cwd=root)
+
+    info("Adding '{}' as submodule...".format(subdir_rel))
+    run_git(["submodule", "add", new_repo_url, subdir_rel], cwd=root)
+    run_git(["submodule", "update", "--init", subdir_rel], cwd=root)
+
+    # -----------------------------------------------------------------------
+    # 7. Commit the change in parent
+    # -----------------------------------------------------------------------
+    commit_msg = "chore: detach {} as submodule ({})".format(subdir_rel, repo_name)
+    info("Committing detach in parent repo...")
+
+    skip_sign, reason = should_skip_signing(cwd=root)
+    if skip_sign:
+        info("Signing skipped: {}".format(reason))
+        run_git(["commit", "-m", commit_msg], cwd=root)
+    else:
+        verify_gpg_available(cwd=root)
+        run_git(["commit", "-S", "-m", commit_msg], cwd=root)
+
+    print()
+    info("Done. '{}' is now a submodule pointing to {}.".format(
+        subdir_rel, new_repo_url))
+    info("Run 'mgit push' to push both repos.")
+
+
+# ---------------------------------------------------------------------------
+# attach — copy a subdir into an existing submodule repo
+# ---------------------------------------------------------------------------
+
+def cmd_attach(root: str, extra_args: List[str]) -> None:
+    """
+    Attach a subdirectory's contents into an existing submodule repo,
+    then remove the subdir from the parent.
+
+    Usage: mgit attach <subdir> <submodule-path>
+
+    The subdir's contents are copied into <submodule-path>, committed
+    there, and the original <subdir> is removed from the parent. The
+    parent then gets a commit recording both changes.
+    """
+    # -----------------------------------------------------------------------
+    # 0. Parse args
+    # -----------------------------------------------------------------------
+    if len(extra_args) < 2:
+        die("Usage: mgit attach <subdir> <submodule-path>\n"
+            "       Moves a subdirectory's contents into an existing submodule.")
+
+    subdir_arg = extra_args[0].rstrip("/")
+    target_arg = extra_args[1].rstrip("/")
+
+    subdir_abs = os.path.normpath(os.path.join(root, subdir_arg))
+    subdir_rel = os.path.relpath(subdir_abs, root)
+
+    target_abs = os.path.normpath(os.path.join(root, target_arg))
+    target_rel = os.path.relpath(target_abs, root)
+
+    # -----------------------------------------------------------------------
+    # 1. Validate
+    # -----------------------------------------------------------------------
+    if not os.path.isdir(subdir_abs):
+        die("Subdir not found: {}".format(subdir_abs))
+
+    if not subdir_abs.startswith(root + os.sep):
+        die("Subdir must be inside the repo root.")
+
+    # Target must be an existing submodule
+    existing_subs = get_submodule_paths(root)
+    if target_abs not in existing_subs:
+        die("'{}' is not a submodule of this repo.\n"
+            "       Available submodules: {}".format(
+                target_rel,
+                ", ".join(os.path.relpath(s, root) for s in existing_subs) or "(none)"))
+
+    # Subdir must not itself be a submodule
+    if subdir_abs in existing_subs:
+        die("'{}' is already a submodule — use 'mgit push' to manage it.".format(
+            subdir_rel))
+
+    # Must not have uncommitted changes
+    if has_any_changes(root):
+        die("The repo has uncommitted changes. Please commit or stash them first.")
+    if has_any_changes(target_abs):
+        die("The target submodule '{}' has uncommitted changes. "
+            "Please commit or stash them first.".format(target_rel))
+
+    # -----------------------------------------------------------------------
+    # 2. Determine destination inside target submodule
+    # -----------------------------------------------------------------------
+    # By default, contents go into a subdirectory named after subdir inside target.
+    # Ask the user if they want a different destination path within the submodule.
+    default_dest_rel = os.path.basename(subdir_rel)
+    print()
+    info("Attaching '{}' into submodule '{}'.".format(subdir_rel, target_rel))
+    print()
+    dest_in_target = prompt(
+        "Destination path inside '{}' (relative)".format(target_rel),
+        default=default_dest_rel
+    )
+    dest_abs = os.path.normpath(os.path.join(target_abs, dest_in_target))
+
+    if os.path.exists(dest_abs):
+        warn("Destination '{}' already exists inside '{}'.".format(
+            dest_in_target, target_rel))
+        if not prompt_yes_no("Merge/overwrite?", default=False):
+            die("Aborted.")
+
+    origin_url  = get_origin_url(root)
+    parent_name = repo_name_from_url(origin_url) or os.path.basename(root)
+    commit_msg_sub = "chore: attach {}/{} from {}".format(
+        target_rel, dest_in_target, parent_name)
+
+    print()
+    info("Summary:")
+    info("  Source subdir     : {}".format(subdir_rel))
+    info("  Target submodule  : {}".format(target_rel))
+    info("  Dest in submodule : {}".format(dest_in_target))
+    info("  Submodule commit  : {}".format(commit_msg_sub))
+    print()
+
+    if not prompt_yes_no("Proceed?", default=True):
+        die("Aborted.", code=0)
+
+    # -----------------------------------------------------------------------
+    # 3. Copy subdir contents into target submodule
+    # -----------------------------------------------------------------------
+    info("Copying '{}' into '{}/{}'...".format(
+        subdir_rel, target_rel, dest_in_target))
+
+    if os.path.isdir(dest_abs):
+        # Merge: copy individual items
+        for item in os.listdir(subdir_abs):
+            src = os.path.join(subdir_abs, item)
+            dst = os.path.join(dest_abs, item)
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+    else:
+        shutil.copytree(subdir_abs, dest_abs)
+
+    # -----------------------------------------------------------------------
+    # 4. Commit inside target submodule
+    # -----------------------------------------------------------------------
+    info("Staging changes in submodule '{}'...".format(target_rel))
+    run_git(["add", "-A"], cwd=target_abs)
+
+    if not has_staged_changes(target_abs):
+        die("Nothing to commit in submodule '{}' after copy — "
+            "destination may already be identical.".format(target_rel))
+
+    skip_sign, reason = should_skip_signing(cwd=target_abs)
+    if skip_sign:
+        info("Signing skipped for submodule: {}".format(reason))
+        run_git(["commit", "-m", commit_msg_sub], cwd=target_abs)
+    else:
+        verify_gpg_available(cwd=target_abs)
+        run_git(["commit", "-S", "-m", commit_msg_sub], cwd=target_abs)
+
+    # -----------------------------------------------------------------------
+    # 5. Remove subdir from parent and commit
+    # -----------------------------------------------------------------------
+    info("Removing '{}' from parent repo...".format(subdir_rel))
+    run_git(["rm", "-r", subdir_rel], cwd=root)
+
+    # Stage the updated submodule ref (which now points to the new commit)
+    run_git(["add", target_rel], cwd=root)
+
+    commit_msg_parent = "chore: attach {} into submodule {}".format(
+        subdir_rel, target_rel)
+
+    info("Committing in parent repo...")
+    skip_sign, reason = should_skip_signing(cwd=root)
+    if skip_sign:
+        info("Signing skipped: {}".format(reason))
+        run_git(["commit", "-m", commit_msg_parent], cwd=root)
+    else:
+        verify_gpg_available(cwd=root)
+        run_git(["commit", "-S", "-m", commit_msg_parent], cwd=root)
+
+    print()
+    info("Done. '{}' has been moved into submodule '{}/{}'.".format(
+        subdir_rel, target_rel, dest_in_target))
+    info("Run 'mgit push' to push both repos.")
+
+
+# ---------------------------------------------------------------------------
 # Command implementations
 # ---------------------------------------------------------------------------
 
@@ -517,6 +1013,8 @@ KNOWN_COMMANDS = {
     "fetch":   cmd_fetch,
     "diff":    cmd_diff,
     "log":     cmd_log,
+    "detach":  cmd_detach,
+    "attach":  cmd_attach,
 }
 
 
@@ -528,6 +1026,10 @@ def main() -> None:
         print()
         print("Supported multi-repo commands:")
         print("  status, add, commit, push, pull, fetch, diff, log")
+        print()
+        print("Submodule management:")
+        print("  detach <subdir>                  — extract subdir into new GitHub repo, re-add as submodule")
+        print("  attach <subdir> <submodule-path> — move subdir contents into an existing submodule")
         print()
         print("Any other git command is passed through to all repos.")
         print("Run from any directory inside a git repo.")
