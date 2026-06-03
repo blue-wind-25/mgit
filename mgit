@@ -32,7 +32,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -782,12 +782,180 @@ def do_commit(repo: str, rel: str, msg: str, is_bot: bool,
 # detach — split a subdir into its own new GitHub repo and re-add as submodule
 # ---------------------------------------------------------------------------
 
+def _parse_detach_args(root: str, extra_args: List[str]):
+    """
+    Parse extra_args for cmd_detach and return a normalised descriptor:
+
+        (source_items, subdir_abs, subdir_rel, dest_subdir, repo_name_default)
+
+    source_items  : list of absolute paths to copy into the new repo
+    subdir_abs    : absolute path of the directory being detached
+                    (= the parent dir when flat/glob mode is used)
+    subdir_rel    : repo-relative version of subdir_abs
+    dest_subdir   : name of the wrapper folder inside the new repo,
+                    or '' for a flat copy
+    repo_name_default : suggested default for the repo name prompt
+
+    Supported call forms
+    --------------------
+    Single directory — dest_subdir defaults to the last path segment:
+        mgit detach gui_frontend/src/jcom
+
+    Single directory with trailing slash — flat copy, no wrapper:
+        mgit detach gui_frontend/src/jcom/
+
+    Multiple paths (shell glob expansion) — flat copy, repo name default
+    derived from the common parent directory:
+        mgit detach gui_frontend/src/jcom/*
+
+    Explicit flags (override the above defaults):
+        --dest-subdir <name>   wrap contents in <name>/ inside the new repo
+        --dest-subdir=<name>   same, alternate syntax
+        --no-dest-subdir       flat copy regardless of trailing slash
+    """
+    USAGE = (
+        "Usage: mgit detach <subdir>\n"
+        "       mgit detach <subdir>/          (flat — no wrapper subdir)\n"
+        "       mgit detach <subdir>/*         (flat — shell glob, same effect)\n"
+        "       mgit detach <subdir> --dest-subdir <name>\n"
+        "       mgit detach <subdir> --no-dest-subdir"
+    )
+
+    if not extra_args:
+        die(USAGE)
+
+    # -----------------------------------------------------------------------
+    # Strip --dest-subdir / --no-dest-subdir flags from args
+    # -----------------------------------------------------------------------
+    flag_dest_subdir = None   # None = not specified; '' = no-subdir; str = name
+    remaining = []
+    i = 0
+    while i < len(extra_args):
+        a = extra_args[i]
+        if a == "--no-dest-subdir":
+            flag_dest_subdir = ""
+        elif a == "--dest-subdir" and i + 1 < len(extra_args):
+            flag_dest_subdir = extra_args[i + 1].strip("/\\")
+            i += 1
+        elif a.startswith("--dest-subdir="):
+            flag_dest_subdir = a[len("--dest-subdir="):].strip("/\\")
+        else:
+            remaining.append(a)
+        i += 1
+
+    if not remaining:
+        die(USAGE)
+
+    # -----------------------------------------------------------------------
+    # Determine mode from remaining args
+    # -----------------------------------------------------------------------
+    # Normalise each path: resolve relative to root, strip trailing separators
+    abs_paths = []
+    for p in remaining:
+        # Strip trailing slashes AFTER recording whether the original had one
+        abs_paths.append(os.path.normpath(os.path.join(root, p)))
+
+    # Check for trailing slash on original single argument — flat mode signal
+    original_had_trailing_slash = (
+        len(remaining) == 1
+        and remaining[0].endswith(("/", "\\"))
+        and not remaining[0].rstrip("/\\") == ""
+    )
+
+    if len(remaining) == 1:
+        # -----------------------------------------------------------------------
+        # Single-path form: mgit detach <subdir>  or  mgit detach <subdir>/
+        # -----------------------------------------------------------------------
+        subdir_abs = abs_paths[0]
+        subdir_rel = os.path.relpath(subdir_abs, root)
+
+        if not os.path.isdir(subdir_abs):
+            die("Subdir not found: {}".format(subdir_abs))
+        if not subdir_abs.startswith(root + os.sep):
+            die("Subdir must be inside the repo root: {}".format(root))
+        if subdir_abs in get_submodule_paths(root):
+            die("'{}' is already a submodule.".format(subdir_rel))
+
+        source_items = [os.path.join(subdir_abs, n) for n in os.listdir(subdir_abs)]
+        repo_name_default = os.path.basename(subdir_abs)
+
+        if flag_dest_subdir is not None:
+            # Explicit flag overrides everything
+            dest_subdir = flag_dest_subdir
+        elif original_had_trailing_slash:
+            # Trailing slash → user explicitly asked for flat
+            dest_subdir = ""
+        else:
+            # Default: wrap in a subdir named after the directory
+            dest_subdir = os.path.basename(subdir_abs)
+
+    else:
+        # -----------------------------------------------------------------------
+        # Multi-path form: mgit detach <subdir>/*  (shell glob expansion)
+        # All paths must exist and share the same parent directory.
+        # -----------------------------------------------------------------------
+        for p in abs_paths:
+            if not os.path.exists(p):
+                die("Path not found: {}".format(p))
+
+        parents = set(os.path.dirname(p) for p in abs_paths)
+        if len(parents) != 1:
+            die("All paths passed to mgit detach must share the same parent directory.\n"
+                "       Got parents: {}".format(", ".join(sorted(parents))))
+
+        common_parent = parents.pop()
+        if not common_parent.startswith(root + os.sep) and common_parent != root:
+            die("Paths must be inside the repo root: {}".format(root))
+
+        subdir_abs = common_parent
+        subdir_rel = os.path.relpath(subdir_abs, root)
+
+        # Verify the parent is not already a submodule
+        if subdir_abs in get_submodule_paths(root):
+            die("'{}' is already a submodule.".format(subdir_rel))
+
+        source_items = abs_paths
+        repo_name_default = os.path.basename(common_parent)
+
+        # Multi-path (glob) form is always flat unless explicitly overridden
+        dest_subdir = flag_dest_subdir if flag_dest_subdir is not None else ""
+
+    return source_items, subdir_abs, subdir_rel, dest_subdir, repo_name_default
+
+
+def _copy_items(source_items: List[str], dest_root: str) -> None:
+    """Copy a list of files/directories into dest_root."""
+    for src in source_items:
+        name = os.path.basename(src)
+        dst  = os.path.join(dest_root, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+
 def cmd_detach(root: str, extra_args: List[str]) -> None:
     """
     Detach a subdirectory from the current repo, create a new GitHub repo
     for it, and re-add it as a submodule.
 
-    Usage: mgit detach <subdir>
+    Supported forms:
+      mgit detach <subdir>
+          Contents are wrapped in a <subdir-name>/ folder inside the new repo
+          (e.g. detaching jcom/ creates a repo whose root contains jcom/).
+
+      mgit detach <subdir>/
+          Trailing slash — flat copy, contents go directly to the repo root.
+
+      mgit detach <subdir>/*
+          Shell glob expansion — flat copy from the named items; repo name
+          default is derived from the common parent directory.
+
+      mgit detach <subdir> --dest-subdir <name>
+          Wrap contents in <name>/ regardless of trailing slash.
+
+      mgit detach <subdir> --no-dest-subdir
+          Flat copy regardless of trailing slash.
 
     The new repo can be created under the authenticated user's personal
     account or any GitHub organisation they belong to. mgit prompts for
@@ -798,24 +966,11 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
       - Fine-grained tokens cannot list org memberships or create org repos.
     See README.md § "GitHub CLI authentication" for setup options.
     """
-    if not extra_args:
-        die("Usage: mgit detach <subdir>\n"
-            "       Detaches a subdirectory into its own repo and adds it as a submodule.")
-
-    subdir_abs = os.path.normpath(os.path.join(root, extra_args[0].rstrip("/\\")))
-    subdir_rel = os.path.relpath(subdir_abs, root)
-
     # -----------------------------------------------------------------------
-    # Validate
+    # Parse arguments
     # -----------------------------------------------------------------------
-    if not os.path.isdir(subdir_abs):
-        die("Subdir not found: {}".format(subdir_abs))
-
-    if not subdir_abs.startswith(root + os.sep):
-        die("Subdir must be inside the repo root: {}".format(root))
-
-    if subdir_abs in get_submodule_paths(root):
-        die("'{}' is already a submodule.".format(subdir_rel))
+    source_items, subdir_abs, subdir_rel, dest_subdir, repo_name_default = \
+        _parse_detach_args(root, extra_args)
 
     if has_any_changes(root):
         die("The repo has uncommitted changes. Please commit or stash them first.")
@@ -831,12 +986,16 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     print()
     info("Detaching '{}' from '{}' into a new GitHub repo.".format(
         subdir_rel, parent_name))
+    if dest_subdir:
+        info("Contents will be placed under '{}/'' in the new repo.".format(dest_subdir))
+    else:
+        info("Contents will be placed flat at the new repo root.")
 
     # Determine owner — personal account or an org
     owner = gh_get_owner(cwd=root)
 
     print()
-    repo_name = prompt("New repo name", default=os.path.basename(subdir_rel))
+    repo_name = prompt("New repo name", default=repo_name_default)
     repo_desc = prompt("Description (optional)", default="")
     is_public = prompt_yes_no("Make the new repo public?", default=True)
 
@@ -860,6 +1019,8 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     info("Summary:")
     info("  Subdir      : {}".format(subdir_rel))
     info("  New repo    : {}".format(qualified_name))
+    info("  Layout      : {}".format(
+        "{}/  (wrapped)".format(dest_subdir) if dest_subdir else "(flat)"))
     info("  Visibility  : {}".format("public" if is_public else "private"))
     info("  Initial msg : {}".format(initial_commit_msg))
     print()
@@ -877,13 +1038,14 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
     try:
         run_git(["init"], cwd=tmpdir)
 
-        for item in os.listdir(subdir_abs):
-            src = os.path.join(subdir_abs, item)
-            dst = os.path.join(tmpdir, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst)
-            else:
-                shutil.copy2(src, dst)
+        # Determine copy destination — flat or wrapped in a subdir
+        if dest_subdir:
+            copy_dest = os.path.join(tmpdir, dest_subdir)
+            os.makedirs(copy_dest)
+        else:
+            copy_dest = tmpdir
+
+        _copy_items(source_items, copy_dest)
 
         run_git(["add", "-A"], cwd=tmpdir)
 
@@ -1269,7 +1431,11 @@ def main() -> None:
         print("  status, add, commit [-m \"msg\"], push, pull, fetch, diff, log")
         print()
         print("Submodule management (requires gh CLI):")
-        print("  detach <subdir>                  — extract subdir into new GitHub repo, re-add as submodule")
+        print("  detach <subdir>                  — detach subdir; contents wrapped in <subdir>/ in new repo")
+        print("  detach <subdir>/                 — detach flat (trailing slash = no wrapper subdir)")
+        print("  detach <subdir>/*                — detach flat from shell-expanded contents")
+        print("  detach <subdir> --dest-subdir <name>  — wrap contents in <name>/ explicitly")
+        print("  detach <subdir> --no-dest-subdir      — flat copy explicitly")
         print("  attach <subdir> <submodule-path> — move subdir contents into an existing submodule")
         print()
         print("Any other git command is passed through to all repos.")

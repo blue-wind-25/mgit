@@ -106,14 +106,40 @@ The editor is resolved in this order: `GIT_EDITOR` → `core.editor` (git config
 
 Extracts a subdirectory from the current repo, creates a new GitHub repository for it, and re-adds it as a submodule. The subdirectory's git history is not carried over — the new repo starts with a single clean initial commit.
 
+#### Call forms and repo layout
+
+The call form controls how content is laid out inside the new repo:
+
 ```bash
-mgit detach libs/crypto
+# Default — contents wrapped in a jcom/ subdir at the new repo root
+mgit detach gui_frontend/src/jcom
+
+# Trailing slash — flat copy, contents go directly to the new repo root
+mgit detach gui_frontend/src/jcom/
+
+# Shell glob expansion — flat copy from the named items;
+# repo name default derived from the common parent (jcom)
+mgit detach gui_frontend/src/jcom/*
+
+# Explicit wrapper subdir name
+mgit detach gui_frontend/src/jcom --dest-subdir src
+
+# Explicit flat, overrides default wrapping
+mgit detach gui_frontend/src/jcom --no-dest-subdir
 ```
 
-`mgit` will interactively ask for:
+**Default (no trailing slash):** the last path segment becomes the wrapper subdir. Detaching `gui_frontend/src/jcom` creates a new repo whose root contains `jcom/com`, `jcom/ecma335`, etc. This preserves your package root structure inside the repo and is the right default for Java/Kotlin packages, Python packages, or any project where the directory name is the package name.
 
-- **Owner** — your personal account or any GitHub organisation you belong to (prompted when org memberships are detected; see [Owner selection](#owner-selection) below)
-- **New repo name** — defaults to the subdirectory basename
+**Flat (trailing slash or `/*`):** contents go directly to the repo root. `jcom/com`, `jcom/ecma335` become `com/`, `ecma335/` at the root.
+
+The submodule mount point in the parent repo (`gui_frontend/src/jcom`) is always the same regardless of layout — only the internal structure of the new repo differs.
+
+#### Interactive prompts
+
+`mgit` will ask for:
+
+- **Owner** — your personal account or any GitHub organisation you belong to (see [Owner selection](#owner-selection) below)
+- **New repo name** — editable; defaults to the last path segment (`jcom`), or the common parent name when using glob expansion
 - **Description** — optional, passed to `gh repo create`
 - **Visibility** — public or private
 - **Initial commit message** — whether to include the parent repo name (a privacy warning is shown for public repos)
@@ -121,7 +147,7 @@ mgit detach libs/crypto
 The sequence performed:
 
 1. Validates the subdir exists, is not already a submodule, and the working tree is clean
-2. Creates a temporary git repo, copies the subdir contents in, and commits
+2. Creates a temporary git repo, copies contents in (flat or wrapped), and commits
 3. Creates the GitHub repo via `gh` and pushes
 4. Removes the subdir from the parent with `git rm -r`
 5. Adds the new repo back as a submodule
