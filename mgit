@@ -37,10 +37,21 @@ def unorm(s: str) -> str:
 IS_WINDOWS = sys.platform == "win32"
 
 # ---------------------------------------------------------------------------
+# Windows UTF-8 console output
+# ---------------------------------------------------------------------------
+# Force UTF-8 for stdout/stderr on Windows so non-ASCII filenames, repo
+# names, and commit messages display correctly regardless of the system
+# code page. reconfigure() is Python 3.7+; on 3.6 we silently skip it
+# (Python 3.6 is EOL and has no clean stdlib-only UTF-8 console fix).
+if IS_WINDOWS and sys.version_info >= (3, 7):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+
+# ---------------------------------------------------------------------------
 # Defaults (overridable via .mgitconfig)
 # ---------------------------------------------------------------------------
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 DEFAULT_REF_COMMIT_MSG = "chore: update submodule refs"
 
@@ -375,7 +386,6 @@ def open_editor_for_message(repo_label: str, cwd: str = None) -> str:
         if ret != 0:
             die("Editor exited with code {}. Aborting.".format(ret))
 
-        #with open(tmp_path, "r", newline=None) as f:
         with open(tmp_path, "r", encoding="utf-8", newline=None) as f:
             raw = f.read()
     finally:
@@ -775,20 +785,6 @@ def repo_name_from_url(url: str) -> str:
     return parts[-1] if parts else ""
 
 
-def repo_owner_from_url(url: str) -> str:
-    """
-    Extract the owner (user or org) from a remote URL.
-    Handles both https://github.com/owner/name.git and git@github.com:owner/name.git.
-    Returns '' if parsing fails.
-    """
-    if not url:
-        return ""
-    url = re.sub(r"\.git$", "", url)
-    parts = [p for p in re.split(r"[/:]", url) if p]
-    # parts looks like: ['github.com', 'owner', 'name']
-    return parts[-2] if len(parts) >= 2 else ""
-
-
 def gh_repo_owner() -> str:
     """Return the authenticated GitHub username via gh, or ''."""
     return gh_output(["api", "user", "--jq", ".login"])
@@ -972,7 +968,7 @@ def _parse_detach_args(root: str, extra_args: List[str]):
         if a == "--no-dest-subdir":
             flag_dest_subdir = ""
         elif a == "--dest-subdir" and i + 1 < len(extra_args):
-            flag_dest_subdir = extra_args[i + 1].strip("/\\")
+            flag_dest_subdir = unorm(extra_args[i + 1].strip("/\\"))
             i += 1
         elif a.startswith("--dest-subdir="):
             flag_dest_subdir = unorm(a[len("--dest-subdir="):].strip("/\\"))
@@ -991,13 +987,6 @@ def _parse_detach_args(root: str, extra_args: List[str]):
     for p in remaining:
         # Strip trailing slashes AFTER recording whether the original had one
         abs_paths.append(os.path.normpath(os.path.join(root, unorm(p))))
-
-    # Check for trailing slash on original single argument — flat mode signal
-    original_had_trailing_slash = (
-        len(remaining) == 1
-        and remaining[0].endswith(("/", "\\"))
-        and not remaining[0].rstrip("/\\") == ""
-    )
 
     if len(remaining) == 1:
         # -----------------------------------------------------------------------
@@ -1360,7 +1349,7 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
         subdir_rel, target_rel, dest_in_target))
 
     if os.path.isdir(dest_abs):
-        entries = [norm(n) for n in os.listdir(subdir_abs)]
+        entries = [unorm(n) for n in os.listdir(subdir_abs)]
         for item in entries:
             src = os.path.join(subdir_abs, item)
             dst = os.path.join(dest_abs, item)

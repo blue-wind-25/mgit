@@ -463,6 +463,8 @@ git config --global gpg.program "C:\Program Files (x86)\GnuPG\bin\gpg.exe"
 
 **Paths:** `mgit` uses `os.path` throughout, which handles Windows path separators correctly.
 
+**Unicode and UTF-8:** `mgit` automatically configures UTF-8 output on Python 3.7+ so non-ASCII filenames, repo names, and commit messages display correctly regardless of the Windows system code page. `mgit.cmd` also sets `PYTHONUTF8=1` as an additional layer. On Python 3.6 (EOL since 2018) UTF-8 output is not guaranteed — upgrading to Python 3.7 or later is recommended.
+
 **gh on Windows:** If `gh` is not found, `mgit` prints winget and Scoop install instructions and exits. For the `[gh] token` option, use your user-global `~/.mgitconfig` — on Windows this resolves to `%USERPROFILE%\.mgitconfig`.
 
 ## Configuration
