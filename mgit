@@ -20,7 +20,15 @@ import tempfile
 import fnmatch
 import configparser
 import subprocess
+import unicodedata
 from typing import List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Unicode normalization
+# ---------------------------------------------------------------------------
+def unorm(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -213,7 +221,7 @@ def run_git(args: List[str], cwd: str = None, check: bool = True,
 def git_output(args: List[str], cwd: str = None) -> str:
     """Run git and return stdout; returns '' on error, never raises."""
     result = run_git(args, cwd=cwd, check=False, capture=True)
-    return result.stdout.strip()
+    return unorm(result.stdout.strip())
 
 
 def git_ok(args: List[str], cwd: str = None) -> bool:
@@ -967,7 +975,7 @@ def _parse_detach_args(root: str, extra_args: List[str]):
             flag_dest_subdir = extra_args[i + 1].strip("/\\")
             i += 1
         elif a.startswith("--dest-subdir="):
-            flag_dest_subdir = a[len("--dest-subdir="):].strip("/\\")
+            flag_dest_subdir = unorm(a[len("--dest-subdir="):].strip("/\\"))
         else:
             remaining.append(a)
         i += 1
@@ -982,7 +990,7 @@ def _parse_detach_args(root: str, extra_args: List[str]):
     abs_paths = []
     for p in remaining:
         # Strip trailing slashes AFTER recording whether the original had one
-        abs_paths.append(os.path.normpath(os.path.join(root, p)))
+        abs_paths.append(os.path.normpath(os.path.join(root, unorm(p))))
 
     # Check for trailing slash on original single argument — flat mode signal
     original_had_trailing_slash = (
@@ -1000,12 +1008,12 @@ def _parse_detach_args(root: str, extra_args: List[str]):
 
         if not os.path.isdir(subdir_abs):
             die("Subdir not found: {}".format(subdir_abs))
-        if not subdir_abs.startswith(root + os.sep):
+        if not os.path.commonpath([root, subdir_abs]) == root:
             die("Subdir must be inside the repo root: {}".format(root))
         if subdir_abs in get_submodule_paths(root):
             die("'{}' is already a submodule.".format(subdir_rel))
 
-        source_items = [os.path.join(subdir_abs, n) for n in os.listdir(subdir_abs)]
+        source_items = [os.path.join(subdir_abs, unorm(n)) for n in os.listdir(subdir_abs)]
         repo_name_default = os.path.basename(subdir_abs)
 
         if flag_dest_subdir is not None:
@@ -1032,7 +1040,7 @@ def _parse_detach_args(root: str, extra_args: List[str]):
                 "       Got parents: {}".format(", ".join(sorted(parents))))
 
         common_parent = parents.pop()
-        if not common_parent.startswith(root + os.sep) and common_parent != root:
+        if os.path.commonpath([root, common_parent]) != root:
             die("Paths must be inside the repo root: {}".format(root))
 
         subdir_abs = common_parent
@@ -1277,10 +1285,10 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
         die("Usage: mgit attach <subdir> <submodule-path>\n"
             "       Moves a subdirectory's contents into an existing submodule.")
 
-    subdir_abs = os.path.normpath(os.path.join(root, extra_args[0].rstrip("/\\")))
+    subdir_abs = os.path.normpath(os.path.join(root, unorm(extra_args[0]).rstrip("/\\")))
     subdir_rel = os.path.relpath(subdir_abs, root)
 
-    target_abs = os.path.normpath(os.path.join(root, extra_args[1].rstrip("/\\")))
+    target_abs = os.path.normpath(os.path.join(root, unorm(extra_args[1]).rstrip("/\\")))
     target_rel = os.path.relpath(target_abs, root)
 
     # -----------------------------------------------------------------------
@@ -1289,7 +1297,7 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
     if not os.path.isdir(subdir_abs):
         die("Subdir not found: {}".format(subdir_abs))
 
-    if not subdir_abs.startswith(root + os.sep):
+    if not os.path.commonpath([root, subdir_abs]) == root:
         die("Subdir must be inside the repo root.")
 
     existing_subs = get_submodule_paths(root)
@@ -1317,10 +1325,10 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
     info("Attaching '{}' into submodule '{}'.".format(subdir_rel, target_rel))
     print()
 
-    dest_in_target = prompt(
+    dest_in_target = unorm(prompt(
         "Destination path inside '{}' (relative)".format(target_rel),
         default=os.path.basename(subdir_rel)
-    )
+    ))
     dest_abs = os.path.normpath(os.path.join(target_abs, dest_in_target))
 
     if os.path.exists(dest_abs):
@@ -1352,7 +1360,8 @@ def cmd_attach(root: str, extra_args: List[str]) -> None:
         subdir_rel, target_rel, dest_in_target))
 
     if os.path.isdir(dest_abs):
-        for item in os.listdir(subdir_abs):
+        entries = [norm(n) for n in os.listdir(subdir_abs)]
+        for item in entries:
             src = os.path.join(subdir_abs, item)
             dst = os.path.join(dest_abs, item)
             if os.path.isdir(src):
