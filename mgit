@@ -188,11 +188,17 @@ def run_git(args: List[str], cwd: str = None, check: bool = True,
             capture: bool = False) -> subprocess.CompletedProcess:
     """Run git with given args in cwd. Streams output unless capture=True."""
     cmd = ["git"] + args
+
+    """Copy system environment and force English logic"""
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+
     verbose("  $ {}  [in {}]".format(" ".join(cmd), cwd or os.getcwd()))
     if capture:
         result = subprocess.run(
-            cmd, cwd=cwd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cmd, cwd=cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
             universal_newlines=True
         )
     else:
@@ -231,7 +237,7 @@ def get_toplevel(path: str) -> Optional[str]:
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=path,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
         universal_newlines=True
     )
     if result.returncode == 0:
@@ -252,7 +258,7 @@ def get_submodule_paths(repo_root: str) -> List[str]:
         ["git", "config", "--file", ".gitmodules",
          "--get-regexp", r"submodule\..*\.path"],
         cwd=repo_root,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
         universal_newlines=True
     )
     if result.returncode != 0:
@@ -361,7 +367,8 @@ def open_editor_for_message(repo_label: str, cwd: str = None) -> str:
         if ret != 0:
             die("Editor exited with code {}. Aborting.".format(ret))
 
-        with open(tmp_path, "r", newline=None) as f:
+        #with open(tmp_path, "r", newline=None) as f:
+        with open(tmp_path, "r", encoding="utf-8", newline=None) as f:
             raw = f.read()
     finally:
         try:
@@ -442,7 +449,7 @@ def has_any_changes(cwd: str) -> bool:
     """Return True if working tree or index has any modifications."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
-        cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
         universal_newlines=True
     )
     return bool(result.stdout.strip())
@@ -456,10 +463,11 @@ def submodule_refs_dirty(parent: str) -> bool:
     result = subprocess.run(
         ["git", "submodule", "status"],
         cwd=parent,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
         universal_newlines=True
     )
     for line in result.stdout.splitlines():
+        # !!! TODO : Will it still work with i18n/l10n? !!!
         if line.startswith("+"):
             return True
     return False
@@ -564,7 +572,7 @@ def _gh_keyring_token() -> str:
     # Get the list of stored accounts and their scopes
     status = subprocess.run(
         ["gh", "auth", "status"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
         universal_newlines=True,
         env=clean_env
     )
@@ -580,6 +588,7 @@ def _gh_keyring_token() -> str:
     for line in output.splitlines():
         line = line.strip()
         # Match account line — extract username
+        # !!! TODO : What if, in the future, 'gh' supports i18n/l10n? Will it still work? !!!
         m = re.search(r"Logged in to \S+ account (\S+)", line)
         if m:
             current_user = m.group(1).rstrip(")")
@@ -589,7 +598,7 @@ def _gh_keyring_token() -> str:
             # Found an account with read:org — get its token
             token_result = subprocess.run(
                 ["gh", "auth", "token", "--user", current_user],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
                 universal_newlines=True,
                 env=clean_env
             )
@@ -702,11 +711,16 @@ def run_gh(args: List[str], check: bool = True,
     """
     cmd = ["gh"] + args
     verbose("  $ {}".format(" ".join(cmd)))
+
+    """Force English logic"""
     env = _gh_env()
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+
     if capture:
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
             universal_newlines=True,
             env=env
         )
@@ -790,6 +804,7 @@ def gh_user_orgs() -> List[str]:
         if not line:
             continue
         # Skip the summary header line gh prints before the list
+        # !!! TODO : What if, in the future, 'gh' supports i18n/l10n? Will it still work? !!!
         if line.lower().startswith("showing ") and " organization" in line.lower():
             continue
         if line.lower() == "there are no organizations":
@@ -1404,7 +1419,7 @@ def _has_message_flag(args: List[str]) -> bool:
             return True
         if a.startswith("-m") and len(a) > 2:      # -m"msg"
             return True
-        if a.startswith("--message="):              # --message=msg
+        if a.startswith("--message="):             # --message=msg
             return True
     return False
 
