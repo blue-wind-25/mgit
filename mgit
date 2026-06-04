@@ -897,6 +897,7 @@ def do_commit(repo: str, rel: str, msg: str, is_bot: bool,
     # Ask the user: proceed unsigned, skip, or enable signing globally.
     choice = prompt_yes_no_sign(rel)
 
+    Si
     if choice == "no":
         info("Skipping commit for {}.".format(rel))
         return False
@@ -905,7 +906,7 @@ def do_commit(repo: str, rel: str, msg: str, is_bot: bool,
         info("Enabling commit.gpgsign globally...")
         run_git(["config", "--global", "commit.gpgsign", "true"])
         check_gpg_available(cwd=repo)
-        run_git(["commit", "-m", msg], cwd=repo)
+        run_git(["commit", "-S", "-m", msg], cwd=repo)
         return True
 
     # choice == "yes" — proceed unsigned
