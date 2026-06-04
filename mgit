@@ -189,7 +189,7 @@ def run_git(args: List[str], cwd: str = None, check: bool = True,
     """Run git with given args in cwd. Streams output unless capture=True."""
     cmd = ["git"] + args
 
-    """Copy system environment and force English logic"""
+    # Copy system environment and force English logic
     env = os.environ.copy()
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
@@ -202,7 +202,7 @@ def run_git(args: List[str], cwd: str = None, check: bool = True,
             universal_newlines=True
         )
     else:
-        result = subprocess.run(cmd, cwd=cwd)
+        result = subprocess.run(cmd, cwd=cwd, env=env)
     if check and result.returncode != 0:
         if capture:
             sys.stderr.write(result.stderr)
@@ -569,6 +569,10 @@ def _gh_keyring_token() -> str:
     clean_env.pop("GITHUB_TOKEN", None)
     clean_env.pop("GH_TOKEN", None)
 
+    # Force English logic
+    clean_env["LC_ALL"] = "C"
+    clean_env["LANG"] = "C"
+
     # Get the list of stored accounts and their scopes
     status = subprocess.run(
         ["gh", "auth", "status"],
@@ -672,6 +676,7 @@ def _gh_explain_403(stderr_text: str) -> None:
     explanation and exit. Called by run_gh when gh returns non-zero.
     """
     text = stderr_text.lower()
+    # !!! TODO : What if, in the future, 'gh' supports i18n/l10n? Will it still work? !!!
     if "403" in text or "forbidden" in text or "resource not accessible" in text \
             or "token cannot" in text or "must have push access" in text:
         print()
@@ -712,7 +717,7 @@ def run_gh(args: List[str], check: bool = True,
     cmd = ["gh"] + args
     verbose("  $ {}".format(" ".join(cmd)))
 
-    """Force English logic"""
+    # Force English logic
     env = _gh_env()
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
@@ -1205,6 +1210,7 @@ def cmd_detach(root: str, extra_args: List[str]) -> None:
             ["repo", "view", qualified_name, "--json", "sshUrl", "--jq", ".sshUrl"])
         if not new_repo_url:
             # Plain text fallback: parse the "Clone URL" line or build manually
+            # !!! TODO: If gh output structure changes, this text scan will break !!!
             plain = gh_output(["repo", "view", qualified_name])
             for line in plain.splitlines():
                 # Look for a git@ SSH URL in the output
