@@ -890,7 +890,7 @@ def do_commit(repo: str, rel: str, msg: str, is_bot: bool,
     if gpg_sign.lower() in ("true", "1", "yes"):
         # Signing is explicitly enabled — verify GPG is usable, then commit
         check_gpg_available(cwd=repo)
-        run_git(["commit", "-m", msg], cwd=repo)
+        run_git(["commit", "-S", "-m", msg], cwd=repo)
         return True
 
     # commit.gpgsign is not set — commits will be unsigned.
