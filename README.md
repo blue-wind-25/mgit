@@ -60,6 +60,7 @@ mgit <command> [args...]
 | `mgit commit` | Commit all repos, opening an editor per repo for individual messages |
 | `mgit push` | Push all submodules, update refs in parent, push root |
 | `mgit pull` | Pull root, then sync and update all submodules |
+| `mgit upsub [path ...]` | Advance submodule(s) to latest remote commit and stage updated ref pointer(s) in the parent. Follow with `mgit commit` and `mgit push`. Optionally limit to specific submodule paths. |
 | `mgit fetch` | Fetch all repos |
 | `mgit diff` | Diff all repos |
 | `mgit log` | Log all repos |
@@ -126,6 +127,27 @@ The editor is resolved in this order: `GIT_EDITOR` → `core.editor` (git config
 `mgit` detects the root of the current repo and operates from there. Running `mgit` from inside a submodule only operates on that submodule and its own nested submodules — it does not walk up to parent repos.
 
 ## Submodule management
+
+### `mgit upsub [path ...]`
+
+Advances each submodule to the latest commit on its tracked remote branch and stages the updated ref pointer(s) in the parent. This is the correct way to bump a submodule to a newer upstream version — for example, after pushing changes to a submodule repo and wanting the parent to record the new commit.
+
+```bash
+# Advance all submodules
+mgit upsub
+
+# Advance a specific submodule only
+mgit upsub src/jcom
+```
+
+This is a deliberate write operation. After running it, the updated pointer(s) are staged but not yet committed or pushed. Complete the update with:
+
+```bash
+mgit commit -m "Update jcom submodule to latest"
+mgit push
+```
+
+`mgit pull` does **not** do this — it checks out whatever commit the parent repo already points to. `upsub` is the explicit "move the pointer forward" step.
 
 ### `mgit detach <subdir>`
 
