@@ -60,7 +60,7 @@ mgit <command> [args...]
 | `mgit commit` | Commit all repos, opening an editor per repo for individual messages |
 | `mgit push` | Push all submodules, update refs in parent, push root |
 | `mgit pull` | Pull root, then sync and update all submodules |
-| `mgit upsub [path ...]` | Advance submodule(s) to latest remote commit and stage updated ref pointer(s) in the parent. Follow with `mgit commit` and `mgit push`. Optionally limit to specific submodule paths. |
+| `mgit upsub [path ...]` | Advance submodule(s) to latest remote commit, stage updated ref pointer(s) in the parent, and reattach each submodule to its remote branch. Follow with `mgit commit` and `mgit push`. Optionally limit to specific submodule paths. |
 | `mgit fetch` | Fetch all repos |
 | `mgit diff` | Diff all repos |
 | `mgit log` | Log all repos |
@@ -130,7 +130,7 @@ The editor is resolved in this order: `GIT_EDITOR` → `core.editor` (git config
 
 ### `mgit upsub [path ...]`
 
-Advances each submodule to the latest commit on its tracked remote branch and stages the updated ref pointer(s) in the parent. This is the correct way to bump a submodule to a newer upstream version — for example, after pushing changes to a submodule repo and wanting the parent to record the new commit.
+Advances each submodule to the latest commit on its tracked remote branch, stages the updated ref pointer(s) in the parent, and reattaches each submodule to its remote branch with a fast-forward merge. This is the correct way to bump a submodule to a newer upstream version — for example, after pushing changes to a submodule repo and wanting the parent to record the new commit.
 
 ```bash
 # Advance all submodules
@@ -140,10 +140,12 @@ mgit upsub
 mgit upsub src/jcom
 ```
 
+After the update, each submodule is left on its remote branch (e.g. `master`) rather than in a detached HEAD state. No `.gitmodules` `branch =` configuration is required — the branch is detected automatically from the remote tracking refs that `git submodule update --remote` already populates.
+
 This is a deliberate write operation. After running it, the updated pointer(s) are staged but not yet committed or pushed. Complete the update with:
 
 ```bash
-mgit commit -m "Update jcom submodule to latest"
+mgit commit -m "chore: update jcom submodule ref"
 mgit push
 ```
 

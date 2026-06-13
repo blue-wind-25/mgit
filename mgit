@@ -294,6 +294,35 @@ def get_submodule_paths(repo_root: str) -> List[str]:
     return paths
 
 
+def submodule_remote_branch(sub_abs: str) -> Optional[str]:
+    """
+    Return the remote branch name whose tip matches the submodule's current
+    HEAD commit. Uses git for-each-ref for compatibility with git 1.8.x+
+    (avoids --points-at which requires git 2.7+).
+    No network call, no .gitmodules config required.
+    """
+    head = git_output(["rev-parse", "HEAD"], cwd=sub_abs)
+    if not head:
+        return None
+    refs = git_output(
+        ["for-each-ref", "--format=%(refname:short) %(objectname)",
+         "refs/remotes/origin/"],
+        cwd=sub_abs
+    )
+    for line in refs.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        refname, sha = parts
+        if sha == head and refname.startswith("origin/"):
+            branch = refname[len("origin/"):]
+            # skip the HEAD alias
+            if branch == "HEAD":
+                continue
+            return branch
+    return None
+
+
 def build_repo_tree(root: str) -> List[str]:
     """
     Recursively collect all repos (root + submodules) in bottom-up order
@@ -1571,6 +1600,20 @@ def cmd_upsub(root: str, extra_args: List[str]) -> None:
         info("Submodule ref(s) staged. Run 'mgit commit' then 'mgit push' to persist.")
     else:
         info("Submodule(s) already at latest — nothing to stage.")
+
+    # Reattach each submodule to its remote default branch.
+    # git submodule update --remote always leaves a detached HEAD; undo that
+    # so the working tree is navigable without any .gitmodules configuration.
+    targets = [os.path.join(root, p) for p in extra_args] if extra_args else subs
+    for sub in targets:
+        rel = os.path.relpath(sub, root)
+        branch = submodule_remote_branch(sub)
+        if not branch:
+            verbose("Cannot determine remote branch for {}, leaving detached.".format(rel))
+            continue
+        info("Reattaching {} → {}.".format(rel, branch))
+        run_git(["checkout", branch], cwd=sub, check=False)
+        run_git(["merge", "--ff-only", "origin/{}".format(branch)], cwd=sub, check=False)
 
 
 def cmd_fetch(root: str, extra_args: List[str]) -> None:
